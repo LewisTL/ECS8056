@@ -16,7 +16,7 @@ huggingface_hub==0.23.4
 
 # Quantisation + device placement
 accelerate==0.30.1
-bitsandbytes==0.43.1
+bitsandbytes>=0.45.0
 
 # Vision / arrays (usually already present on Colab, pinned loosely for safety)
 pillow>=10.0.0
