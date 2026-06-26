@@ -1,0 +1,31 @@
+# --- Model weights & datasets (never commit; cache these in Google Drive) ---
+*.pt
+*.pth
+*.safetensors
+*.bin
+data/
+datasets/
+bridge_orig/
+checkpoints/
+*.tfrecord
+
+# --- Outputs / logs (commit summaries, not raw dumps) ---
+outputs/
+runs/
+wandb/
+*.log
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+*.egg-info/
+
+# --- HF / Colab caches ---
+.cache/
+hf_cache/
+
+# --- OS ---
+.DS_Store

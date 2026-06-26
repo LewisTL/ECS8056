@@ -1,0 +1,23 @@
+# OpenVLA inference-only requirements for Google Colab (M2: Pipeline verified)
+#
+# IMPORTANT: do NOT reinstall torch on Colab. Colab ships a torch build that is
+# matched to its CUDA driver; overriding it tends to break GPU support. We pin
+# only the libraries that govern OpenVLA model loading, plus quantisation deps.
+#
+# The trio below is the OpenVLA authors' known-good set. Newer transformers/timm/
+# tokenizers cause the misleading "requires ... prismatic" load error.
+transformers==4.40.1
+tokenizers==0.19.1
+timm==0.9.10
+
+# huggingface_hub must stay compatible with transformers 4.40.1 (newer hub
+# removes symbols that 4.40 still imports).
+huggingface_hub==0.23.4
+
+# Quantisation + device placement
+accelerate==0.30.1
+bitsandbytes==0.43.1
+
+# Vision / arrays (usually already present on Colab, pinned loosely for safety)
+pillow>=10.0.0
+numpy>=1.24,<2.0
