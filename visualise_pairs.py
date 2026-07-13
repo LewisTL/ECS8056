@@ -5,23 +5,17 @@ visualise_pairs.py
 Render OpenVLA contrastive-pair action deltas as coloured arrows on a tabletop
 scene in Isaac Sim and save one PNG per pair.
 
-Run with Isaac Sim's bundled interpreter:
-    cd <isaac-sim install dir>
-    ./python.sh /path/to/visualise_pairs.py --pairs ~/pairs.json --out ~/figs
+    cd /opt/IsaacSim
+    ./python.sh ~/visualise_pairs.py --pairs ~/pairs.json --out ~/figs
 
-Input: pairs.json produced by export_pairs.py. Per pair the translation parts
-of action_a (blue), action_b (orange) and, when present, gt_vector (grey) are
-drawn as shaft+head arrows from a common tabletop anchor.
+Per pair the translation parts of action_a (blue), action_b (orange) and, when
+present, gt_vector (grey) are drawn as shaft+head arrows from a common anchor.
 
-Display scaling: predicted deltas are centimetre-scale and would be invisible
-at true size, so within each pair both predicted arrows share one scale factor
-chosen to make the longer of the two a fixed display length — relative
-magnitude and direction are preserved, absolute length is not. The ground
-truth is scaled independently (different convention; magnitudes are not
-comparable). Scale factors are recorded in the output index for captioning.
-
-Outputs: <out>/<pair_id>.png and <out>/index.csv (pair_id, instructions,
-dx values, sign-flip flag, scale factors) for figure captions.
+Display scaling: predicted deltas are centimetre-scale and invisible at true
+size, so within each pair both predicted arrows share one scale factor making
+the longer a fixed display length. Direction and relative magnitude are
+preserved; absolute length is not. Ground truth is scaled independently
+(different convention). Scale factors are recorded in index.csv for captions.
 """
 
 import argparse
@@ -29,44 +23,47 @@ import csv
 import os
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--pairs", required=True, help="path to pairs.json")
-parser.add_argument("--out", default="./figs", help="output directory")
-parser.add_argument("--gui", action="store_true", help="render with the GUI (default headless)")
-parser.add_argument("--limit", type=int, default=0, help="render only the first N pairs")
+parser.add_argument("--pairs", required=True)
+parser.add_argument("--out", default="./figs")
+parser.add_argument("--gui", action="store_true", help="show GUI (default headless)")
+parser.add_argument("--limit", type=int, default=0)
 parser.add_argument("--resolution", type=int, nargs=2, default=[1280, 720])
 args = parser.parse_args()
 
-# ---- 1. The app must exist before any omni/isaacsim import ------------------
+# ---- 1. App before any omni/isaacsim import --------------------------------
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": not args.gui})
 
-# ---- 2. Version-tolerant imports (5.x namespace, 4.x fallback) ---------------
 import json
 import numpy as np
 
+# ---- 2. Version-tolerant imports -------------------------------------------
 try:
     from isaacsim.core.api import World
     from isaacsim.core.api.objects import FixedCuboid, VisualCylinder, VisualCone
     from isaacsim.sensors.camera import Camera
+    from isaacsim.core.utils.viewports import set_camera_view
 except ImportError:  # Isaac Sim 4.x
     from omni.isaac.core import World
     from omni.isaac.core.objects import FixedCuboid, VisualCylinder, VisualCone
     from omni.isaac.sensor import Camera
+    from omni.isaac.core.utils.viewports import set_camera_view
 
 from PIL import Image
 
 COLOR_A = np.array([0.10, 0.45, 1.00])   # instruction A - blue
 COLOR_B = np.array([1.00, 0.55, 0.10])   # instruction B - orange
 COLOR_GT = np.array([0.45, 0.45, 0.45])  # ground truth  - grey
-DISPLAY_LEN = 0.25       # metres: display length of the longer arrow in a pair
+DISPLAY_LEN = 0.25
 SHAFT_RADIUS = 0.006
 HEAD_RADIUS = 0.016
 HEAD_LEN = 0.05
-SETTLE_FRAMES = 60       # first pair also absorbs shader compilation
+
+CAM_EYE = [2.2, 2.2, 1.8]
+CAM_TARGET = [0.40, 0.0, 0.25]
 
 
 def quat_from_z(direction):
-    """Quaternion (w, x, y, z) rotating +Z onto `direction`."""
     z = np.asarray(direction, dtype=float)
     z = z / (np.linalg.norm(z) + 1e-12)
     zaxis = np.array([0.0, 0.0, 1.0])
@@ -80,31 +77,12 @@ def quat_from_z(direction):
     return np.array([np.cos(ang / 2.0), v[0] * s, v[1] * s, v[2] * s])
 
 
-def look_at_quat(eye, target, up=(0.0, 0.0, 1.0)):
-    """World orientation for a USD camera (looks down -Z) at `eye` facing `target`."""
-    eye, target = np.asarray(eye, float), np.asarray(target, float)
-    z = eye - target
-    z = z / (np.linalg.norm(z) + 1e-12)          # camera +Z points away from target
-    x = np.cross(np.asarray(up, float), z)
-    x = x / (np.linalg.norm(x) + 1e-12)
-    y = np.cross(z, x)
-    m = np.stack([x, y, z], axis=1)
-    w = np.sqrt(max(0.0, 1.0 + m[0, 0] + m[1, 1] + m[2, 2])) / 2.0
-    if w < 1e-8:
-        return np.array([1.0, 0, 0, 0])
-    return np.array([w,
-                     (m[2, 1] - m[1, 2]) / (4 * w),
-                     (m[0, 2] - m[2, 0]) / (4 * w),
-                     (m[1, 0] - m[0, 1]) / (4 * w)])
-
-
 class ArrowSet:
-    """Creates and re-poses a fixed set of arrow prims instead of re-adding
-    prims per pair — prim creation mid-run is slow and leak-prone."""
+    """Fixed arrow prims, re-posed per pair (prim creation mid-run is slow)."""
 
     def __init__(self, world, names_colors):
         self.parts = {}
-        far = np.array([0.0, 0.0, -10.0])       # parked out of view
+        far = np.array([0.0, 0.0, -10.0])
         for name, color in names_colors:
             shaft = world.scene.add(VisualCylinder(
                 prim_path=f"/World/{name}_shaft", name=f"{name}_shaft",
@@ -152,17 +130,21 @@ def main():
         color=np.array([0.85, 0.85, 0.85])))
 
     anchor_default = np.array([0.40, 0.0, 0.20])
-    cam_eye = np.array([1.35, 1.35, 0.95])
-    camera = Camera(
-        prim_path="/World/cam",
-        position=cam_eye,
-        orientation=look_at_quat(cam_eye, anchor_default),
-        resolution=tuple(args.resolution))
-
     arrows = ArrowSet(world, [("arrow_a", COLOR_A), ("arrow_b", COLOR_B),
                               ("arrow_gt", COLOR_GT)])
+
+    # Camera: aim the persp viewport (the setup proven by camera_check.py).
+    set_camera_view(eye=CAM_EYE, target=CAM_TARGET)
+    try:
+        camera = Camera(prim_path="/OmniverseKit_Persp",
+                        resolution=tuple(args.resolution))
+    except Exception:
+        camera = Camera(prim_path="/World/cap_cam", position=np.array(CAM_EYE),
+                        resolution=tuple(args.resolution))
+
     world.reset()
     camera.initialize()
+    set_camera_view(eye=CAM_EYE, target=CAM_TARGET)   # re-aim after reset
 
     index_rows = []
     for i, p in enumerate(pairs):
@@ -185,7 +167,8 @@ def main():
         else:
             arrows.hide("arrow_gt")
 
-        for _ in range(SETTLE_FRAMES if i == 0 else 15):
+        # Settle: 60 frames on the first pair (absorbs warm-up), 20 after.
+        for _ in range(60 if i == 0 else 20):
             world.step(render=True)
 
         rgba = camera.get_rgba()
@@ -210,7 +193,6 @@ def main():
         w.writeheader()
         w.writerows(index_rows)
     print(f"wrote {len(index_rows)} figures + {index_path}")
-
     simulation_app.close()
 
 
