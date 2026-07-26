@@ -27,8 +27,11 @@ Render one pair by scene_id or pair_id (prefix and epNN shorthand accepted):
 `rclone copy gdrive:openvla_cache/bridge_multiobj/frames ~/bridge_frames`).
 Pairs whose image can't be found still render, without the photo.
 
-Scale caveat: one OpenVLA delta is ~3 mm; --scale exaggerates it for
-visibility. Direction is faithful, distance is not, so state this in captions.
+Scale caveat: OpenVLA deltas are millimetre-scale. By default each pair is scaled
+so the longer role reaches `--display-len` metres (same idea as the arrow
+figures), then the arm moves from a fixed workspace anchor along that vector.
+This shows directional difference, not a BridgeData pick-and-place replay.
+Use `--scale` only to override with a fixed multiplier.
 """
 
 import argparse
@@ -51,8 +54,19 @@ ap.add_argument("--list", action="store_true",
                 help="print available pair_id / scene_id values and exit "
                      "(does not launch Isaac Sim)")
 ap.add_argument("--limit", type=int, default=0)
-ap.add_argument("--scale", type=float, default=40.0)
-ap.add_argument("--steps", type=int, default=120)
+ap.add_argument("--display-len", type=float, default=0.12,
+                help="max displacement (m) per pair after per-pair scaling "
+                     "(matches the arrow-figure idea)")
+ap.add_argument("--scale", type=float, default=None,
+                help="fixed delta multiplier; overrides --display-len when set")
+ap.add_argument("--anchor", type=float, nargs=3, default=[0.45, 0.0, 0.35],
+                help="workspace pose the arm approaches before each role")
+ap.add_argument("--min-ee-z", type=float, default=0.20,
+                help="minimum end-effector height (m) when clamping targets")
+ap.add_argument("--approach-steps", type=int, default=40,
+                help="sim steps to reach the workspace anchor")
+ap.add_argument("--steps", type=int, default=80,
+                help="sim steps for the interpolated delta motion")
 ap.add_argument("--fps", type=int, default=30)
 ap.add_argument("--trail-every", type=int, default=4,
                 help="drop a trail sphere every N sim steps")
@@ -153,6 +167,64 @@ PANEL_W = 640            # left panel width; sim frame is 1280x720 -> 1920x720
 SIM_W, SIM_H = 1280, 720
 TRAIL_POOL = 80          # spheres per role
 PARK = np.array([0.0, 0.0, -10.0])
+MAX_REACH = 0.22          # clamp displacement from anchor (metres)
+
+
+def pair_display_scale(action_a, action_b, display_len, fixed_scale=None):
+    """Return the multiplier applied to raw translation deltas for this pair."""
+    if fixed_scale is not None:
+        return fixed_scale
+    ta = np.asarray(action_a[:3], dtype=float)
+    tb = np.asarray(action_b[:3], dtype=float)
+    longest = max(float(np.linalg.norm(ta)), float(np.linalg.norm(tb)))
+    return (display_len / longest) if longest > 1e-6 else 0.0
+
+
+def clamp_ee_target(pos, anchor, min_z, max_reach=MAX_REACH):
+    """Keep the target above the floor and within reach of the anchor."""
+    pos = np.asarray(pos, dtype=float)
+    anchor = np.asarray(anchor, dtype=float)
+    pos[2] = max(pos[2], min_z)
+    offset = pos - anchor
+    dist = float(np.linalg.norm(offset))
+    if dist > max_reach:
+        pos = anchor + offset * (max_reach / dist)
+        pos[2] = max(pos[2], min_z)
+    return pos
+
+
+def move_ee(controller, franka, world, target_pos, target_quat, steps, grab=None):
+    """Hold one Cartesian target for a fixed number of sim steps."""
+    target_pos = np.asarray(target_pos, dtype=float)
+    for _ in range(steps):
+        action = controller.forward(
+            target_end_effector_position=target_pos,
+            target_end_effector_orientation=target_quat)
+        franka.apply_action(action)
+        world.step(render=True)
+        if grab is not None:
+            grab()
+
+
+def move_ee_linear(controller, franka, world, start, end, target_quat, steps,
+                   grab=None, trail=None, trail_every=4):
+    """Interpolate the end effector along a straight segment (smoother than one
+    distant RMPFlow target)."""
+    start = np.asarray(start, dtype=float)
+    end = np.asarray(end, dtype=float)
+    for s in range(steps):
+        alpha = (s + 1) / steps
+        waypoint = start + alpha * (end - start)
+        action = controller.forward(
+            target_end_effector_position=waypoint,
+            target_end_effector_orientation=target_quat)
+        franka.apply_action(action)
+        world.step(render=True)
+        if trail is not None and s % trail_every == 0:
+            ee_pos, _ = franka.end_effector.get_world_pose()
+            trail.drop(ee_pos)
+        if grab is not None:
+            grab()
 
 
 class Trail:
@@ -276,7 +348,10 @@ def main():
 
     home_joints = franka.get_joint_positions()
     ee_home_pos, ee_home_quat = franka.end_effector.get_world_pose()
+    anchor = np.asarray(args.anchor, dtype=float)
     print(f"[rollout] EE home pose: {np.round(ee_home_pos, 3)}")
+    print(f"[rollout] workspace anchor: {np.round(anchor, 3)}  "
+          f"display_len={args.display_len}  min_ee_z={args.min_ee_z}")
 
     def go_home():
         franka.set_joint_positions(home_joints)
@@ -292,33 +367,46 @@ def main():
         trails["a"].clear()
         trails["b"].clear()
         frames = []
+        disp_scale = pair_display_scale(
+            p["action_a"], p["action_b"], args.display_len, args.scale)
 
         for role in ("a", "b"):
             go_home()
             panel = make_panel(scene_img, p[f"instr_{role}"], role, p["pair_id"])
-            delta = np.asarray(p[f"action_{role}"][:3], dtype=float) * args.scale
-            target = ee_home_pos + delta
-            print(f"    {role}: '{p['instr_' + role]}' -> "
-                  f"delta*scale={np.round(delta, 3)}")
 
             def grab():
                 frames.append(compose(
                     camera.get_rgba()[..., :3].astype(np.uint8), panel))
 
             for _ in range(int(args.fps * 0.5)):
-                world.step(render=True); grab()
-            for s in range(args.steps):
-                action = controller.forward(
-                    target_end_effector_position=target,
-                    target_end_effector_orientation=ee_home_quat)
-                franka.apply_action(action)
                 world.step(render=True)
-                if s % args.trail_every == 0:
-                    ee_pos, _ = franka.end_effector.get_world_pose()
-                    trails[role].drop(ee_pos)
                 grab()
+
+            move_ee(controller, franka, world, anchor, ee_home_quat,
+                    args.approach_steps, grab=grab)
+            anchor_pos, _ = franka.end_effector.get_world_pose()
+            anchor_pos = np.asarray(anchor_pos, dtype=float)
+
+            raw = np.asarray(p[f"action_{role}"][:3], dtype=float)
+            delta = raw * disp_scale
+            target = clamp_ee_target(
+                anchor_pos + delta, anchor_pos, args.min_ee_z)
+            print(f"    {role}: scale={disp_scale:.2f}  "
+                  f"delta_disp={np.round(delta, 3)}  "
+                  f"target={np.round(target, 3)}")
+
+            for _ in range(int(args.fps * 0.3)):
+                world.step(render=True)
+                grab()
+
+            move_ee_linear(
+                controller, franka, world, anchor_pos, target, ee_home_quat,
+                args.steps, grab=grab, trail=trails[role],
+                trail_every=args.trail_every)
+
             for _ in range(int(args.fps * 0.7)):
-                world.step(render=True); grab()
+                world.step(render=True)
+                grab()
 
         write_video(frames, os.path.join(out_dir, f"{p['pair_id']}.mp4"), args.fps)
 
