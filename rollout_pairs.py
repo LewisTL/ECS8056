@@ -16,6 +16,10 @@ Usage (terminal inside the DCV desktop for live view, or --headless):
     ./python.sh ~/rollout_pairs.py --pairs ~/pairs.json --out ~/rollouts \
         --frames-root ~/bridge_frames
 
+Render a single clean pair (episode 70):
+    ./python.sh ~/rollout_pairs.py --pairs ~/pairs.json --out ~/rollouts \
+        --frames-root ~/bridge_frames --scene-id 70
+
 --frames-root points at the cached BridgeData frames (copy once with e.g.
 `rclone copy gdrive:openvla_cache/bridge_multiobj/frames ~/bridge_frames`).
 Pairs whose image can't be found still render, without the photo.
@@ -34,6 +38,12 @@ ap.add_argument("--pairs", required=True)
 ap.add_argument("--out", default="./rollouts")
 ap.add_argument("--frames-root", default=None,
                 help="dir containing the cached BridgeData PNGs")
+ap.add_argument("--scene-id", type=int, nargs="+", default=None,
+                help="render only pairs whose scene_id is in this list "
+                     "(e.g. --scene-id 70 for episode 70)")
+ap.add_argument("--pair-id", nargs="+", default=None,
+                help="render only these exact pair_id values "
+                     "(e.g. --pair-id ep000070_left)")
 ap.add_argument("--limit", type=int, default=0)
 ap.add_argument("--scale", type=float, default=40.0)
 ap.add_argument("--steps", type=int, default=120)
@@ -172,8 +182,18 @@ def write_video(frames, path, fps):
 def main():
     with open(os.path.expanduser(args.pairs)) as f:
         pairs = json.load(f)
+    if args.scene_id is not None:
+        wanted_scenes = set(args.scene_id)
+        pairs = [p for p in pairs if int(p["scene_id"]) in wanted_scenes]
+    if args.pair_id is not None:
+        wanted_pairs = set(args.pair_id)
+        pairs = [p for p in pairs if p["pair_id"] in wanted_pairs]
     if args.limit:
         pairs = pairs[: args.limit]
+    if not pairs:
+        raise SystemExit(
+            "[rollout] no pairs matched the given filters "
+            f"(scene-id={args.scene_id}, pair-id={args.pair_id})")
     out_dir = os.path.expanduser(args.out)
     os.makedirs(out_dir, exist_ok=True)
 
