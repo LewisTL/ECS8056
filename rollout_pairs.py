@@ -40,6 +40,12 @@ import os
 import re
 import textwrap
 
+try:
+    from export_pairs import map_action, BRIDGE_TO_ISAAC
+except ImportError:
+    map_action = None
+    BRIDGE_TO_ISAAC = None
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--pairs", required=True)
 ap.add_argument("--out", default="./rollouts")
@@ -157,6 +163,15 @@ except ImportError:  # Isaac Sim 4.x
 
 from PIL import Image, ImageDraw, ImageFont
 
+if map_action is None:
+    BRIDGE_TO_ISAAC = np.eye(3)
+
+    def map_action(values):
+        """Map Bridge action translation into Isaac world axes (fallback copy)."""
+        a = np.asarray(values, dtype=float).copy()
+        a[:3] = BRIDGE_TO_ISAAC @ a[:3]
+        return a
+
 CAM_EYE = [1.9, 1.9, 1.5]
 CAM_TARGET = [0.45, 0.0, 0.35]
 COLOR_A_RGB = (26, 115, 255)
@@ -170,14 +185,31 @@ PARK = np.array([0.0, 0.0, -10.0])
 MAX_REACH = 0.22          # clamp displacement from anchor (metres)
 
 
-def pair_display_scale(action_a, action_b, display_len, fixed_scale=None):
-    """Return the multiplier applied to raw translation deltas for this pair."""
+def pair_display_scale(mapped_a, mapped_b, display_len, fixed_scale=None):
+    """Return the multiplier applied to mapped translation deltas for this pair."""
     if fixed_scale is not None:
         return fixed_scale
-    ta = np.asarray(action_a[:3], dtype=float)
-    tb = np.asarray(action_b[:3], dtype=float)
+    ta = np.asarray(mapped_a[:3], dtype=float)
+    tb = np.asarray(mapped_b[:3], dtype=float)
     longest = max(float(np.linalg.norm(ta)), float(np.linalg.norm(tb)))
     return (display_len / longest) if longest > 1e-6 else 0.0
+
+
+def log_pair_deltas(p):
+    """Print Bridge and Isaac deltas for both roles (model output, not injected)."""
+    ma = map_action(p["action_a"])[:3]
+    mb = map_action(p["action_b"])[:3]
+    ba = np.asarray(p["action_a"][:3], dtype=float)
+    bb = np.asarray(p["action_b"][:3], dtype=float)
+    print(f"    bridge A {np.round(ba, 6)}  B {np.round(bb, 6)}  "
+          f"diff {np.round(bb - ba, 6)}")
+    print(f"    isaac  A {np.round(ma, 6)}  B {np.round(mb, 6)}  "
+          f"diff {np.round(mb - ma, 6)}")
+    for axis, name in enumerate("xyz"):
+        flip = ma[axis] * mb[axis] < 0
+        if abs(ma[axis]) > 1e-6 or abs(mb[axis]) > 1e-6:
+            print(f"    {name}-sign flip in logged actions: "
+                  f"{'yes' if flip else 'no'}")
 
 
 def clamp_ee_target(pos, anchor, min_z, max_reach=MAX_REACH):
@@ -352,6 +384,7 @@ def main():
     print(f"[rollout] EE home pose: {np.round(ee_home_pos, 3)}")
     print(f"[rollout] workspace anchor: {np.round(anchor, 3)}  "
           f"display_len={args.display_len}  min_ee_z={args.min_ee_z}")
+    print(f"[rollout] BRIDGE_TO_ISAAC =\n{BRIDGE_TO_ISAAC}")
 
     def go_home():
         franka.set_joint_positions(home_joints)
@@ -367,8 +400,12 @@ def main():
         trails["a"].clear()
         trails["b"].clear()
         frames = []
+        log_pair_deltas(p)
+        mapped_a = map_action(p["action_a"])
+        mapped_b = map_action(p["action_b"])
         disp_scale = pair_display_scale(
-            p["action_a"], p["action_b"], args.display_len, args.scale)
+            mapped_a, mapped_b, args.display_len, args.scale)
+        start = anchor.copy()
 
         for role in ("a", "b"):
             go_home()
@@ -382,25 +419,22 @@ def main():
                 world.step(render=True)
                 grab()
 
-            move_ee(controller, franka, world, anchor, ee_home_quat,
+            move_ee(controller, franka, world, start, ee_home_quat,
                     args.approach_steps, grab=grab)
-            anchor_pos, _ = franka.end_effector.get_world_pose()
-            anchor_pos = np.asarray(anchor_pos, dtype=float)
 
-            raw = np.asarray(p[f"action_{role}"][:3], dtype=float)
-            delta = raw * disp_scale
-            target = clamp_ee_target(
-                anchor_pos + delta, anchor_pos, args.min_ee_z)
+            mapped = map_action(p[f"action_{role}"])[:3]
+            delta = np.asarray(mapped, dtype=float) * disp_scale
+            target = clamp_ee_target(start + delta, start, args.min_ee_z)
             print(f"    {role}: scale={disp_scale:.2f}  "
-                  f"delta_disp={np.round(delta, 3)}  "
-                  f"target={np.round(target, 3)}")
+                  f"isaac_delta_disp={np.round(delta, 4)}  "
+                  f"target={np.round(target, 4)}")
 
             for _ in range(int(args.fps * 0.3)):
                 world.step(render=True)
                 grab()
 
             move_ee_linear(
-                controller, franka, world, anchor_pos, target, ee_home_quat,
+                controller, franka, world, start, target, ee_home_quat,
                 args.steps, grab=grab, trail=trails[role],
                 trail_every=args.trail_every)
 
