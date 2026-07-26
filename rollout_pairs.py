@@ -16,9 +16,12 @@ Usage (terminal inside the DCV desktop for live view, or --headless):
     ./python.sh ~/rollout_pairs.py --pairs ~/pairs.json --out ~/rollouts \
         --frames-root ~/bridge_frames
 
-Render a single clean pair (episode 70):
+List available pair_id / scene_id values (no Isaac launch):
+    ./python.sh ~/rollout_pairs.py --pairs ~/pairs.json --list
+
+Render one pair by scene_id or pair_id (prefix and epNN shorthand accepted):
     ./python.sh ~/rollout_pairs.py --pairs ~/pairs.json --out ~/rollouts \
-        --frames-root ~/bridge_frames --scene-id 70
+        --frames-root ~/bridge_frames --pair-id ep000070
 
 --frames-root points at the cached BridgeData frames (copy once with e.g.
 `rclone copy gdrive:openvla_cache/bridge_multiobj/frames ~/bridge_frames`).
@@ -31,6 +34,7 @@ visibility. Direction is faithful, distance is not, so state this in captions.
 import argparse
 import json
 import os
+import re
 import textwrap
 
 ap = argparse.ArgumentParser()
@@ -39,11 +43,13 @@ ap.add_argument("--out", default="./rollouts")
 ap.add_argument("--frames-root", default=None,
                 help="dir containing the cached BridgeData PNGs")
 ap.add_argument("--scene-id", type=int, nargs="+", default=None,
-                help="render only pairs whose scene_id is in this list "
-                     "(e.g. --scene-id 70 for episode 70)")
+                help="render only pairs whose scene_id is in this list")
 ap.add_argument("--pair-id", nargs="+", default=None,
-                help="render only these exact pair_id values "
-                     "(e.g. --pair-id ep000070_left)")
+                help="render matching pair_id values: exact match, prefix, "
+                     "or epNN / NN shorthand (e.g. ep70 -> ep000070_*)")
+ap.add_argument("--list", action="store_true",
+                help="print available pair_id / scene_id values and exit "
+                     "(does not launch Isaac Sim)")
 ap.add_argument("--limit", type=int, default=0)
 ap.add_argument("--scale", type=float, default=40.0)
 ap.add_argument("--steps", type=int, default=120)
@@ -52,6 +58,67 @@ ap.add_argument("--trail-every", type=int, default=4,
                 help="drop a trail sphere every N sim steps")
 ap.add_argument("--headless", action="store_true")
 args = ap.parse_args()
+
+
+def _pair_id_patterns(raw: str):
+    """Expand a user selector into matchable pair_id prefixes / exact ids."""
+    raw = raw.strip()
+    out = {raw}
+    m = re.fullmatch(r"(?:ep)?(\d+)", raw, flags=re.IGNORECASE)
+    if m:
+        out.add(f"ep{int(m.group(1)):06d}")
+    return out
+
+
+def _pair_id_matches(pair_id: str, selectors) -> bool:
+    for sel in selectors:
+        for pat in _pair_id_patterns(sel):
+            if pair_id == pat or pair_id.startswith(pat + "_") or pair_id.startswith(pat):
+                return True
+    return False
+
+
+def load_and_filter_pairs(path, scene_ids=None, pair_ids=None, limit=0):
+    """Load pairs.json and apply optional scene / pair filters."""
+    with open(os.path.expanduser(path)) as f:
+        all_pairs = json.load(f)
+    pairs = list(all_pairs)
+    if scene_ids is not None:
+        wanted = set(scene_ids)
+        pairs = [p for p in pairs if int(p["scene_id"]) in wanted]
+    if pair_ids is not None:
+        pairs = [p for p in pairs if _pair_id_matches(p["pair_id"], pair_ids)]
+    if limit:
+        pairs = pairs[:limit]
+    return all_pairs, pairs
+
+
+def format_pair_index(pairs):
+    lines = [f"  {p['pair_id']}  (scene_id={p['scene_id']})" for p in pairs]
+    return "\n".join(lines) if lines else "  (none)"
+
+
+all_pairs, pairs = load_and_filter_pairs(
+    args.pairs, args.scene_id, args.pair_id, args.limit)
+
+if args.list:
+    print(f"[rollout] {len(all_pairs)} pairs in {args.pairs}")
+    print(format_pair_index(all_pairs))
+    raise SystemExit(0)
+
+if not pairs:
+    filtered = args.scene_id is not None or args.pair_id is not None or args.limit
+    msg = ["[rollout] no pairs matched the given filters "
+           f"(scene-id={args.scene_id}, pair-id={args.pair_id}, limit={args.limit})",
+           f"[rollout] {len(all_pairs)} pairs available:"]
+    msg.append(format_pair_index(all_pairs))
+    if filtered:
+        msg.append("[rollout] re-run with --list, or pass a pair_id / scene_id "
+                   "from the list above")
+    raise SystemExit("\n".join(msg))
+
+print(f"[rollout] rendering {len(pairs)}/{len(all_pairs)} pairs: "
+      f"{', '.join(p['pair_id'] for p in pairs)}")
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": args.headless})
@@ -180,20 +247,6 @@ def write_video(frames, path, fps):
 
 
 def main():
-    with open(os.path.expanduser(args.pairs)) as f:
-        pairs = json.load(f)
-    if args.scene_id is not None:
-        wanted_scenes = set(args.scene_id)
-        pairs = [p for p in pairs if int(p["scene_id"]) in wanted_scenes]
-    if args.pair_id is not None:
-        wanted_pairs = set(args.pair_id)
-        pairs = [p for p in pairs if p["pair_id"] in wanted_pairs]
-    if args.limit:
-        pairs = pairs[: args.limit]
-    if not pairs:
-        raise SystemExit(
-            "[rollout] no pairs matched the given filters "
-            f"(scene-id={args.scene_id}, pair-id={args.pair_id})")
     out_dir = os.path.expanduser(args.out)
     os.makedirs(out_dir, exist_ok=True)
 
