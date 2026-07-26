@@ -69,11 +69,18 @@ TRANSFER_PREPS = frozenset({"on", "onto", "in", "into", "from", "inside"})
 _WORD_RE = re.compile(r"[a-z]+")
 
 
+# Instruction categories (see `classify_instruction`).
+CATEGORY_REFERENT = "referent_selection"   # spatial term selects WHICH object
+CATEGORY_PLACEMENT = "placement_relation"  # spatial term is a DESTINATION
+CATEGORY_OTHER = "other"                    # no usable spatial term
+
+
 @dataclass
 class InstructionTags:
     spatial_tokens: list[str] = field(default_factory=list)
     spatial_phrases: list[str] = field(default_factory=list)
     has_transfer: bool = False
+    category: str = CATEGORY_OTHER
 
     @property
     def has_spatial(self) -> bool:
@@ -94,8 +101,60 @@ class InstructionTags:
         return "|".join(parts)
 
 
+def _earliest_pos(lowered: str, tokens: list[str], phrases: list[str]) -> int | None:
+    """Character offset of the earliest matched spatial cue, or None."""
+    positions = []
+    for tok in tokens:
+        m = re.search(rf"\b{re.escape(tok)}\b", lowered)
+        if m:
+            positions.append(m.start())
+    for ph in phrases:
+        idx = lowered.find(ph)
+        if idx >= 0:
+            positions.append(idx)
+    return min(positions) if positions else None
+
+
+def _earliest_transfer_verb_pos(lowered: str, word_set: set[str]) -> int | None:
+    """Character offset of the earliest transfer verb, or None."""
+    positions = []
+    for verb in TRANSFER_VERBS & word_set:
+        m = re.search(rf"\b{re.escape(verb)}\b", lowered)
+        if m:
+            positions.append(m.start())
+    return min(positions) if positions else None
+
+
+def _categorise(lowered: str, word_set: set[str],
+                spatial_pos: int | None) -> str:
+    """Assign an instruction category from the spatial cue's role.
+
+    Heuristic (transparent and approximate):
+      * "placement_relation" — a transfer verb (put/place/move/stack/set) is
+        present and the spatial cue occurs AFTER it, i.e. the term specifies a
+        destination, e.g. "move the cloth to the right of the colander". This
+        extends the transfer-verb + preposition detection with the spatial
+        term's position relative to the verb phrase.
+      * "referent_selection" — a spatial cue is present but the placement test
+        fails, so the term selects which object to act on, e.g. "pick up the
+        cup on the left".
+      * "other" — no spatial cue.
+
+    Known limitation: a spatial term that selects a referent yet follows a
+    transfer verb (e.g. "put the cup on the left down") is misread as a
+    placement. Categories are annotated, not deleted, so manual review can
+    correct edge cases.
+    """
+    if spatial_pos is None:
+        return CATEGORY_OTHER
+    verb_pos = _earliest_transfer_verb_pos(lowered, word_set)
+    if verb_pos is not None and spatial_pos > verb_pos:
+        return CATEGORY_PLACEMENT
+    return CATEGORY_REFERENT
+
+
 def classify_instruction(text: str) -> InstructionTags:
-    """Tag an instruction with spatial and transfer cues.
+    """Tag an instruction with spatial and transfer cues, plus a category.
 
     The heuristic is approximate by design: scene composition is inferred from
     language alone, so terse multi-object descriptions may be missed and unusual
@@ -109,8 +168,10 @@ def classify_instruction(text: str) -> InstructionTags:
     tokens = sorted(SPATIAL_TOKENS & word_set)
     phrases = [p for p in SPATIAL_PHRASES if p in lowered]
     transfer = bool(TRANSFER_VERBS & word_set) and bool(TRANSFER_PREPS & word_set)
+    spatial_pos = _earliest_pos(lowered, tokens, phrases)
+    category = _categorise(lowered, word_set, spatial_pos)
     return InstructionTags(spatial_tokens=tokens, spatial_phrases=phrases,
-                           has_transfer=transfer)
+                           has_transfer=transfer, category=category)
 
 
 # --------------------------------------------------------------------------- #
@@ -198,9 +259,13 @@ def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5):
 # --------------------------------------------------------------------------- #
 # Drive cache (filtered survivors only)
 # --------------------------------------------------------------------------- #
+# Default value for the manual feasibility review (see update_manifest_annotations).
+FEASIBLE_DEFAULT = "unreviewed"
+
 MANIFEST_FIELDS = [
-    "episode_index", "instruction", "is_multi_object", "has_spatial",
+    "episode_index", "instruction", "category", "is_multi_object", "has_spatial",
     "has_transfer", "matched_terms", "num_steps", "image_path",
+    "feasible_both", "feasibility_note",
     "gt_dx", "gt_dy", "gt_dz", "gt_rx", "gt_ry", "gt_rz", "gt_gripper",
 ]
 
@@ -229,12 +294,16 @@ def cache_records(records, out_dir: str, multi_object_only: bool = True) -> str:
             writer.writerow({
                 "episode_index": rec.episode_index,
                 "instruction": rec.instruction,
+                "category": rec.tags.category,
                 "is_multi_object": rec.tags.is_multi_object,
                 "has_spatial": rec.tags.has_spatial,
                 "has_transfer": rec.tags.has_transfer,
                 "matched_terms": rec.tags.matched,
                 "num_steps": rec.num_steps,
                 "image_path": rel,
+                # Feasibility is filled in later by manual review, not deleted.
+                "feasible_both": FEASIBLE_DEFAULT,
+                "feasibility_note": "",
                 "gt_dx": gt[0], "gt_dy": gt[1], "gt_dz": gt[2],
                 "gt_rx": gt[3], "gt_ry": gt[4], "gt_rz": gt[5],
                 "gt_gripper": gt[6],
@@ -249,3 +318,43 @@ def load_manifest(out_dir: str):
     manifest_path = os.path.join(out_dir, "manifest.csv")
     with open(manifest_path, newline="") as f:
         return list(csv.DictReader(f))
+
+
+def update_manifest_annotations(out_dir: str, annotations: dict) -> str:
+    """Rewrite the manifest with manual feasibility annotations filled in.
+
+    Annotates rather than deletes: contrastive prompts built by antonym swap can
+    imply physically infeasible placements, so each scene is reviewed for whether
+    the implied placement is possible on BOTH sides of the referent.
+
+    Args:
+        out_dir: directory holding manifest.csv.
+        annotations: {episode_index: {"feasible_both": "yes"|"no"|"unclear",
+            "feasibility_note": str}}. Keys may be int or str; only the provided
+            fields are overwritten, other rows keep their existing values.
+
+    Returns the manifest path.
+    """
+    manifest_path = os.path.join(out_dir, "manifest.csv")
+    rows = load_manifest(out_dir)
+    # Normalise keys to strings so int/str episode indices both match.
+    ann = {str(k): v for k, v in annotations.items()}
+
+    updated = 0
+    for row in rows:
+        note = ann.get(str(row["episode_index"]))
+        if not note:
+            continue
+        if "feasible_both" in note:
+            row["feasible_both"] = note["feasible_both"]
+        if "feasibility_note" in note:
+            row["feasibility_note"] = note["feasibility_note"]
+        updated += 1
+
+    with open(manifest_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in MANIFEST_FIELDS})
+    print(f"[update_manifest_annotations] updated {updated} rows in {manifest_path}")
+    return manifest_path

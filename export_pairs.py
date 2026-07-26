@@ -102,6 +102,12 @@ def build_pairs(preds: pd.DataFrame, manifest: pd.DataFrame | None = None):
             "action_b": act_b, "action_b_std": std_b, "n_b": n_b,
         }
 
+        # Carry stratification fields through for downstream analysis. Prefer the
+        # probe log (logged per prediction), falling back to the manifest.
+        for col in ("category", "feasible_both", "spatial_term"):
+            if col in grp.columns:
+                entry[col] = str(grp[col].iloc[0])
+
         if manifest is not None:
             m = manifest[manifest["scene_id"] == scene_id]
             if len(m):
@@ -109,6 +115,9 @@ def build_pairs(preds: pd.DataFrame, manifest: pd.DataFrame | None = None):
                 gt = map_action([float(m0[c]) for c in GT_COLS])
                 entry["gt_vector"] = gt.tolist()
                 entry["image_path"] = m0["image_path"]
+                for col in ("category", "feasible_both"):
+                    if col not in entry and col in manifest.columns:
+                        entry[col] = str(m0[col])
 
         pairs.append(entry)
     return pairs, skipped
