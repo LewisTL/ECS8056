@@ -1,4 +1,4 @@
-# OpenVLA inference-only requirements for Google Colab (M2: Pipeline verified)
+# OpenVLA inference-only requirements for Google Colab.
 #
 # IMPORTANT: do NOT reinstall torch on Colab. Colab ships a torch build that is
 # matched to its CUDA driver; overriding it tends to break GPU support. We pin

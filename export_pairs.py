@@ -1,5 +1,5 @@
 """
-export_pairs.py — Contrastive-pair assembly and export for external visualisation.
+export_pairs.py: contrastive-pair assembly and export for external visualisation.
 
 Responsibilities:
   * Join the prediction log (written by model.append_prediction_log) with the

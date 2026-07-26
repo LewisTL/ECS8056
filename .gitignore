@@ -29,3 +29,6 @@ hf_cache/
 
 # --- OS ---
 .DS_Store
+
+# --- Documentation (local project docs and agent guides; not tracked) ---
+*.md

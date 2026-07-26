@@ -1,12 +1,12 @@
 """
-data.py — BridgeData V2 (Open X-Embodiment mirror) loading and scene filtering.
+data.py: BridgeData V2 (Open X-Embodiment mirror) loading and scene filtering.
 
 Responsibilities:
   * Stream episodes from the public GCS mirror without a full local download.
   * Extract the initial observation frame, its natural-language instruction, and
     an early-motion ground-truth vector for each episode.
   * Classify instructions as multi-object / spatially-relational via a transparent
-    text heuristic (the pilot filter for objective O2 / risk R2).
+    text heuristic (the pilot filter for multi-object scene selection).
   * Cache the surviving frames plus a manifest to Google Drive as a compact,
     reproducible evaluation set.
 
@@ -130,15 +130,15 @@ def _categorise(lowered: str, word_set: set[str],
     """Assign an instruction category from the spatial cue's role.
 
     Heuristic (transparent and approximate):
-      * "placement_relation" — a transfer verb (put/place/move/stack/set) is
+      * "placement_relation": a transfer verb (put/place/move/stack/set) is
         present and the spatial cue occurs AFTER it, i.e. the term specifies a
         destination, e.g. "move the cloth to the right of the colander". This
         extends the transfer-verb + preposition detection with the spatial
         term's position relative to the verb phrase.
-      * "referent_selection" — a spatial cue is present but the placement test
+      * "referent_selection": a spatial cue is present but the placement test
         fails, so the term selects which object to act on, e.g. "pick up the
         cup on the left".
-      * "other" — no spatial cue.
+      * "other": no spatial cue.
 
     Known limitation: a spatial term that selects a referent yet follows a
     transfer verb (e.g. "put the cup on the left down") is misread as a
@@ -181,8 +181,8 @@ def classify_instruction(text: str) -> InstructionTags:
 class EpisodeRecord:
     episode_index: int
     instruction: str
-    image: np.ndarray            # uint8 (H, W, 3) — initial frame
-    gt_vector: np.ndarray        # float32 (7,) — early-motion ground truth
+    image: np.ndarray            # uint8 (H, W, 3): initial frame
+    gt_vector: np.ndarray        # float32 (7,): early-motion ground truth
     num_steps: int
     tags: InstructionTags
 

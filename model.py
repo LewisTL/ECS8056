@@ -1,5 +1,5 @@
 """
-model.py — Environment-aware OpenVLA-7B loading, action prediction, and run logging.
+model.py: environment-aware OpenVLA-7B loading, action prediction, and run logging.
 
 Dataset-agnostic: loads the model and turns a (PIL image, instruction) pair into a
 7-DoF action vector, and records the conditions each prediction was made under.
@@ -12,9 +12,11 @@ Design choices:
     Ampere-or-newer GPU (A100/L4); a T4 (Turing) cannot use it.
   * Precision is FIXED and explicit (default bf16), not silently derived from the
     GPU. OpenVLA takes the argmax over discretised action bins, so changing dtype
-    between runs can flip a near-boundary bin and fake a directional difference —
-    the exact signal this study measures. The bf16 path refuses to fall back.
-  * Seeds fixed centrally and run conditions logged per prediction (plan R5).
+    between runs can flip a near-boundary bin and fake a directional difference,
+    which is exactly the response the probe measures. The bf16 path refuses to
+    fall back.
+  * Seeds are fixed centrally and run conditions are logged per prediction for
+    reproducibility.
 """
 
 from __future__ import annotations
@@ -67,7 +69,7 @@ def detect_gpu() -> GpuProfile:
 
 
 def set_seed(seed: int = DEFAULT_SEED) -> None:
-    """Fix all RNGs touched during inference (plan R5: reproducibility)."""
+    """Fix all RNGs touched during inference for reproducibility."""
     os.environ["PYTHONHASHSEED"] = str(seed)
     random.seed(seed)
     np.random.seed(seed)
@@ -110,8 +112,8 @@ def load_openvla(
     if precision == "bf16" and not gpu.supports_bf16:
         raise RuntimeError(
             f"{gpu.name} (sm_{gpu.capability[0]}{gpu.capability[1]}) cannot do bf16. "
-            "Use an A100/L4 for evaluation runs, or pass precision='fp16' for a pilot "
-            "— but fp16 results are NOT comparable to bf16."
+            "Use an A100/L4 for evaluation runs, or pass precision='fp16' for a pilot, "
+            "but fp16 results are NOT comparable to bf16."
         )
 
     attn = "eager"
@@ -191,7 +193,7 @@ def predict_action(
 
 
 # --------------------------------------------------------------------------- #
-# Reproducibility: run conditions + CSV logging (plan R5)
+# Reproducibility: run conditions + CSV logging
 # --------------------------------------------------------------------------- #
 def _pkg(name: str) -> str:
     try:
@@ -201,7 +203,7 @@ def _pkg(name: str) -> str:
 
 
 def run_metadata(compute_dtype: torch.dtype, seed: int = DEFAULT_SEED) -> dict:
-    """Conditions every prediction should be stamped with (plan R5)."""
+    """Conditions every prediction should be stamped with."""
     gpu = detect_gpu()
     return {
         "gpu_name": gpu.name,

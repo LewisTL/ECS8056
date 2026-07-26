@@ -21,7 +21,7 @@ Usage (terminal inside the DCV desktop for live view, or --headless):
 Pairs whose image can't be found still render, without the photo.
 
 Scale caveat: one OpenVLA delta is ~3 mm; --scale exaggerates it for
-visibility. Direction is faithful, distance is not — state this in captions.
+visibility. Direction is faithful, distance is not, so state this in captions.
 """
 
 import argparse
