@@ -28,11 +28,10 @@ Render one pair by scene_id or pair_id (prefix and epNN shorthand accepted):
 Pairs whose image can't be found still render, without the photo.
 
 Scale caveat: OpenVLA returns one 7-DoF action per instruction, not a full
-trajectory. By default the rollout uses a stylised pick-place choreography
-(gripper open, approach, close, lift, transport, place, open, retract). The
-predicted translation delta drives the transport leg only (same mapped/scaled
-vector as the arrow figures). Use --motion delta for the legacy straight-line
-displacement demo.
+trajectory. Each pair is scaled so the longer role reaches `--display-len`
+metres, then the arm moves from a fixed workspace anchor along that mapped
+translation vector. Direction is faithful within the display cap; absolute
+distance is not. Use `--scale` only to override with a fixed multiplier.
 """
 
 import argparse
@@ -71,13 +70,9 @@ ap.add_argument("--anchor", type=float, nargs=3, default=[0.45, 0.0, 0.35],
 ap.add_argument("--min-ee-z", type=float, default=0.20,
                 help="minimum end-effector height (m) when clamping targets")
 ap.add_argument("--approach-steps", type=int, default=40,
-                help="sim steps to reach the workspace anchor (delta mode)")
+                help="sim steps to reach the workspace anchor")
 ap.add_argument("--steps", type=int, default=80,
-                help="sim steps for delta-mode motion")
-ap.add_argument("--motion", choices=("choreography", "delta"), default="choreography",
-                help="choreography: stylised pick-place; delta: straight segment")
-ap.add_argument("--no-prop", action="store_true",
-                help="disable the visual grasp prop used in choreography mode")
+                help="sim steps for the interpolated delta motion")
 ap.add_argument("--fps", type=int, default=30)
 ap.add_argument("--trail-every", type=int, default=4,
                 help="drop a trail sphere every N sim steps")
@@ -152,7 +147,7 @@ import numpy as np
 
 try:
     from isaacsim.core.api import World
-    from isaacsim.core.api.objects import VisualCuboid, VisualSphere
+    from isaacsim.core.api.objects import VisualSphere
     from isaacsim.robot.manipulators.examples.franka import Franka
     from isaacsim.robot.manipulators.examples.franka.controllers import (
         RMPFlowController)
@@ -160,7 +155,7 @@ try:
     from isaacsim.core.utils.viewports import set_camera_view
 except ImportError:  # Isaac Sim 4.x
     from omni.isaac.core import World
-    from omni.isaac.core.objects import VisualCuboid, VisualSphere
+    from omni.isaac.core.objects import VisualSphere
     from omni.isaac.franka import Franka
     from omni.isaac.franka.controllers import RMPFlowController
     from omni.isaac.sensor import Camera
@@ -188,14 +183,6 @@ SIM_W, SIM_H = 1280, 720
 TRAIL_POOL = 80          # spheres per role
 PARK = np.array([0.0, 0.0, -10.0])
 MAX_REACH = 0.22          # clamp displacement from anchor (metres)
-APPROACH_DEPTH = 0.10     # descend from hover to grasp (metres)
-LIFT_HEIGHT = 0.08        # lift after close (metres)
-PLACE_DEPTH = 0.08        # lower before release (metres)
-PROP_OFFSET = np.array([0.0, 0.0, -0.06])
-CHOREO_STEPS = {
-    "hover": 12, "approach": 28, "grasp": 18, "lift": 28,
-    "transport": 45, "place_down": 22, "release": 18, "retract": 25,
-}
 
 
 def pair_display_scale(mapped_a, mapped_b, display_len, fixed_scale=None):
@@ -225,88 +212,6 @@ def log_pair_deltas(p):
                   f"{'yes' if flip else 'no'}")
 
 
-def transport_delta(delta_display):
-    """Use the predicted delta for horizontal transport at a fixed height."""
-    d = np.asarray(delta_display, dtype=float).copy()
-    d[2] = 0.0
-    return d
-
-
-def build_choreography_waypoints(start, delta_display, min_z):
-    """Return (position, gripper_cmd, steps) legs for a placement-style demo."""
-    start = np.asarray(start, dtype=float)
-    hover = start.copy()
-    grasp = clamp_ee_target(start + np.array([0.0, 0.0, -APPROACH_DEPTH]),
-                            start, min_z)
-    lifted = clamp_ee_target(grasp + np.array([0.0, 0.0, LIFT_HEIGHT]),
-                             start, min_z)
-    transport = lifted + transport_delta(delta_display)
-    transport = clamp_ee_target(transport, start, min_z)
-    transport[2] = lifted[2]
-    place = clamp_ee_target(transport + np.array([0.0, 0.0, -PLACE_DEPTH]),
-                            start, min_z)
-    retract = transport.copy()
-    return [
-        (hover, None, CHOREO_STEPS["hover"]),
-        (grasp, None, CHOREO_STEPS["approach"]),
-        (grasp, "close", CHOREO_STEPS["grasp"]),
-        (lifted, None, CHOREO_STEPS["lift"]),
-        (transport, None, CHOREO_STEPS["transport"]),
-        (place, None, CHOREO_STEPS["place_down"]),
-        (place, "open", CHOREO_STEPS["release"]),
-        (retract, None, CHOREO_STEPS["retract"]),
-    ]
-
-
-def gripper_set(franka, world, open_wide, settle=12):
-    """Drive the Franka gripper open or closed over several sim steps."""
-    try:
-        if open_wide:
-            franka.gripper.open()
-        else:
-            franka.gripper.close()
-    except Exception:
-        joints = np.asarray(franka.get_joint_positions(), dtype=float)
-        joints[-2:] = [0.04, 0.04] if open_wide else [0.0, 0.0]
-        franka.set_joint_positions(joints)
-    for _ in range(settle):
-        world.step(render=True)
-
-
-class GraspProp:
-    """Small visual cuboid parked at the grasp point and released at the place."""
-
-    def __init__(self, world):
-        self.cube = world.scene.add(VisualCuboid(
-            prim_path="/World/grasp_prop", name="grasp_prop",
-            position=PARK.copy(), scale=np.array([0.04, 0.04, 0.04]),
-            color=np.array([0.85, 0.25, 0.20])))
-        self.grasped = False
-
-    def park(self):
-        self.grasped = False
-        self.cube.set_world_pose(PARK.copy(), np.array([1.0, 0, 0, 0]))
-
-    def show_at(self, pos):
-        self.grasped = False
-        self.cube.set_world_pose(np.asarray(pos, dtype=float),
-                                 np.array([1.0, 0, 0, 0]))
-
-    def grasp(self, ee_pos):
-        self.grasped = True
-        self._sync(ee_pos)
-
-    def release(self, place_pos):
-        self.grasped = False
-        self.cube.set_world_pose(np.asarray(place_pos, dtype=float),
-                                 np.array([1.0, 0, 0, 0]))
-
-    def _sync(self, ee_pos):
-        if self.grasped:
-            self.cube.set_world_pose(np.asarray(ee_pos, dtype=float) + PROP_OFFSET,
-                                     np.array([1.0, 0, 0, 0]))
-
-
 def clamp_ee_target(pos, anchor, min_z, max_reach=MAX_REACH):
     """Keep the target above the floor and within reach of the anchor."""
     pos = np.asarray(pos, dtype=float)
@@ -334,7 +239,7 @@ def move_ee(controller, franka, world, target_pos, target_quat, steps, grab=None
 
 
 def move_ee_linear(controller, franka, world, start, end, target_quat, steps,
-                   grab=None, trail=None, trail_every=4, prop=None):
+                   grab=None, trail=None, trail_every=4):
     """Interpolate the end effector along a straight segment (smoother than one
     distant RMPFlow target)."""
     start = np.asarray(start, dtype=float)
@@ -347,49 +252,11 @@ def move_ee_linear(controller, franka, world, start, end, target_quat, steps,
             target_end_effector_orientation=target_quat)
         franka.apply_action(action)
         world.step(render=True)
-        if prop is not None and prop.grasped:
-            ee_pos, _ = franka.end_effector.get_world_pose()
-            prop.grasp(ee_pos)
         if trail is not None and s % trail_every == 0:
             ee_pos, _ = franka.end_effector.get_world_pose()
             trail.drop(ee_pos)
         if grab is not None:
             grab()
-
-
-def run_choreography(controller, franka, world, start, delta, quat, min_z,
-                       grab, trail, prop, trail_every):
-    """Execute the pick-place template; predicted delta drives the transport leg."""
-    gripper_set(franka, world, True, settle=10)
-    legs = build_choreography_waypoints(start, delta, min_z)
-    grasp_pos = legs[1][0]
-    if prop is not None:
-        prop.show_at(np.asarray(grasp_pos, dtype=float) + PROP_OFFSET)
-    ee_pos = np.asarray(start, dtype=float)
-    for target, grip_cmd, n_steps in legs:
-        target = np.asarray(target, dtype=float)
-        if grip_cmd is None:
-            move_ee_linear(controller, franka, world, ee_pos, target, quat, n_steps,
-                           grab=grab, trail=trail, trail_every=trail_every,
-                           prop=prop)
-            ee_pos = target
-            continue
-        if grip_cmd == "close":
-            gripper_set(franka, world, False)
-            if prop is not None:
-                ee_now, _ = franka.end_effector.get_world_pose()
-                prop.grasp(ee_now)
-        elif grip_cmd == "open":
-            if prop is not None:
-                prop.release(np.asarray(ee_pos, dtype=float) + PROP_OFFSET)
-            gripper_set(franka, world, True)
-        for _ in range(n_steps):
-            world.step(render=True)
-            if trail is not None:
-                ee_now, _ = franka.end_effector.get_world_pose()
-                trail.drop(ee_now)
-            if grab is not None:
-                grab()
 
 
 class Trail:
@@ -495,7 +362,6 @@ def main():
     franka = world.scene.add(Franka(prim_path="/World/franka", name="franka"))
 
     trails = {"a": Trail(world, "a", COLOR_A), "b": Trail(world, "b", COLOR_B)}
-    prop = None if args.no_prop or args.motion != "choreography" else GraspProp(world)
 
     set_camera_view(eye=CAM_EYE, target=CAM_TARGET)
     try:
@@ -518,8 +384,6 @@ def main():
     print(f"[rollout] EE home pose: {np.round(ee_home_pos, 3)}")
     print(f"[rollout] workspace anchor: {np.round(anchor, 3)}  "
           f"display_len={args.display_len}  min_ee_z={args.min_ee_z}")
-    print(f"[rollout] motion={args.motion}  prop="
-          f"{'off' if prop is None else 'on'}")
     print(f"[rollout] BRIDGE_TO_ISAAC =\n{BRIDGE_TO_ISAAC}")
 
     def go_home():
@@ -545,8 +409,6 @@ def main():
 
         for role in ("a", "b"):
             go_home()
-            if prop is not None:
-                prop.park()
             panel = make_panel(scene_img, p[f"instr_{role}"], role, p["pair_id"])
 
             def grab():
@@ -559,25 +421,21 @@ def main():
 
             mapped = map_action(p[f"action_{role}"])[:3]
             delta = np.asarray(mapped, dtype=float) * disp_scale
+            move_ee(controller, franka, world, start, ee_home_quat,
+                    args.approach_steps, grab=grab)
+            target = clamp_ee_target(start + delta, start, args.min_ee_z)
             print(f"    {role}: scale={disp_scale:.2f}  "
-                  f"isaac_delta_disp={np.round(delta, 4)}")
+                  f"isaac_delta_disp={np.round(delta, 4)}  "
+                  f"target={np.round(target, 4)}")
 
-            if args.motion == "choreography":
-                run_choreography(
-                    controller, franka, world, start, delta, ee_home_quat,
-                    args.min_ee_z, grab, trails[role], prop, args.trail_every)
-            else:
-                move_ee(controller, franka, world, start, ee_home_quat,
-                        args.approach_steps, grab=grab)
-                target = clamp_ee_target(start + delta, start, args.min_ee_z)
-                print(f"      target={np.round(target, 4)}")
-                for _ in range(int(args.fps * 0.3)):
-                    world.step(render=True)
-                    grab()
-                move_ee_linear(
-                    controller, franka, world, start, target, ee_home_quat,
-                    args.steps, grab=grab, trail=trails[role],
-                    trail_every=args.trail_every)
+            for _ in range(int(args.fps * 0.3)):
+                world.step(render=True)
+                grab()
+
+            move_ee_linear(
+                controller, franka, world, start, target, ee_home_quat,
+                args.steps, grab=grab, trail=trails[role],
+                trail_every=args.trail_every)
 
             for _ in range(int(args.fps * 0.7)):
                 world.step(render=True)
