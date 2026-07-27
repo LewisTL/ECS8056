@@ -21,7 +21,11 @@ List available pair_id / scene_id values (no Isaac launch):
 
 Render one pair by scene_id or pair_id (prefix and epNN shorthand accepted):
     ./python.sh ~/rollout_pairs.py --pairs ~/pairs.json --out ~/rollouts \
-        --frames-root ~/bridge_frames --pair-id ep000070
+        --frames-root ~/bridge_frames --pair-id ep000000
+
+Grasp-frame placement pairs (post-grasp observation):
+    ./python.sh ~/rollout_pairs.py --pairs ~/pairs.json --out ~/rollouts \
+        --frames-root ~/bridge_frames --frame grasp --pair-id ep000000
 
 --frames-root points at the cached BridgeData frames (copy once with e.g.
 `rclone copy gdrive:openvla_cache/bridge_multiobj/frames ~/bridge_frames`).
@@ -56,8 +60,11 @@ ap.add_argument("--scene-id", type=int, nargs="+", default=None,
 ap.add_argument("--pair-id", nargs="+", default=None,
                 help="render matching pair_id values: exact match, prefix, "
                      "or epNN / NN shorthand (e.g. ep70 -> ep000070_*)")
+ap.add_argument("--frame", nargs="+", choices=("initial", "grasp"), default=None,
+                help="render only pairs at these observation frames "
+                     "(e.g. --frame grasp for post-grasp placement pairs)")
 ap.add_argument("--list", action="store_true",
-                help="print available pair_id / scene_id values and exit "
+                help="print available pair_id / scene_id / frame values and exit "
                      "(does not launch Isaac Sim)")
 ap.add_argument("--limit", type=int, default=0)
 ap.add_argument("--display-len", type=float, default=0.12,
@@ -98,8 +105,19 @@ def _pair_id_matches(pair_id: str, selectors) -> bool:
     return False
 
 
-def load_and_filter_pairs(path, scene_ids=None, pair_ids=None, limit=0):
-    """Load pairs.json and apply optional scene / pair filters."""
+def pair_frame(p):
+    """Observation frame for a pair record; older exports default to initial."""
+    return str(p.get("frame", "initial"))
+
+
+def output_stem(p):
+    """Unique video basename: pair_id plus frame so initial/grasp do not collide."""
+    return f"{p['pair_id']}_{pair_frame(p)}"
+
+
+def load_and_filter_pairs(path, scene_ids=None, pair_ids=None, frames=None,
+                          limit=0):
+    """Load pairs.json and apply optional scene / pair / frame filters."""
     with open(os.path.expanduser(path)) as f:
         all_pairs = json.load(f)
     pairs = list(all_pairs)
@@ -108,18 +126,24 @@ def load_and_filter_pairs(path, scene_ids=None, pair_ids=None, limit=0):
         pairs = [p for p in pairs if int(p["scene_id"]) in wanted]
     if pair_ids is not None:
         pairs = [p for p in pairs if _pair_id_matches(p["pair_id"], pair_ids)]
+    if frames is not None:
+        wanted_frames = set(frames)
+        pairs = [p for p in pairs if pair_frame(p) in wanted_frames]
     if limit:
         pairs = pairs[:limit]
     return all_pairs, pairs
 
 
 def format_pair_index(pairs):
-    lines = [f"  {p['pair_id']}  (scene_id={p['scene_id']})" for p in pairs]
+    lines = [
+        f"  {p['pair_id']}  frame={pair_frame(p)}  (scene_id={p['scene_id']})"
+        for p in pairs
+    ]
     return "\n".join(lines) if lines else "  (none)"
 
 
 all_pairs, pairs = load_and_filter_pairs(
-    args.pairs, args.scene_id, args.pair_id, args.limit)
+    args.pairs, args.scene_id, args.pair_id, args.frame, args.limit)
 
 if args.list:
     print(f"[rollout] {len(all_pairs)} pairs in {args.pairs}")
@@ -127,18 +151,20 @@ if args.list:
     raise SystemExit(0)
 
 if not pairs:
-    filtered = args.scene_id is not None or args.pair_id is not None or args.limit
+    filtered = (args.scene_id is not None or args.pair_id is not None
+                or args.frame is not None or args.limit)
     msg = ["[rollout] no pairs matched the given filters "
-           f"(scene-id={args.scene_id}, pair-id={args.pair_id}, limit={args.limit})",
+           f"(scene-id={args.scene_id}, pair-id={args.pair_id}, "
+           f"frame={args.frame}, limit={args.limit})",
            f"[rollout] {len(all_pairs)} pairs available:"]
     msg.append(format_pair_index(all_pairs))
     if filtered:
-        msg.append("[rollout] re-run with --list, or pass a pair_id / scene_id "
-                   "from the list above")
+        msg.append("[rollout] re-run with --list, or pass a pair_id / scene_id / "
+                   "frame from the list above")
     raise SystemExit("\n".join(msg))
 
 print(f"[rollout] rendering {len(pairs)}/{len(all_pairs)} pairs: "
-      f"{', '.join(p['pair_id'] for p in pairs)}")
+      f"{', '.join(output_stem(p) for p in pairs)}")
 
 from isaacsim import SimulationApp
 simulation_app = SimulationApp({"headless": args.headless})
@@ -295,7 +321,7 @@ def load_scene_image(p):
     return None
 
 
-def make_panel(scene_img, instr, role, pair_id):
+def make_panel(scene_img, instr, role, pair_id, frame="initial"):
     """Left panel: scene photo + instruction banner coloured by role."""
     panel = Image.new("RGB", (PANEL_W, SIM_H), (24, 24, 24))
     draw = ImageDraw.Draw(panel)
@@ -306,7 +332,7 @@ def make_panel(scene_img, instr, role, pair_id):
         img.thumbnail((PANEL_W - 20, 440))
         panel.paste(img, ((PANEL_W - img.width) // 2, 10))
         y = 10 + img.height + 14
-        draw.text((10, y), "model input (BridgeData V2)", fill=(150, 150, 150),
+        draw.text((10, y), f"model input ({frame} frame)", fill=(150, 150, 150),
                   font=font)
         y += 22
     else:
@@ -322,7 +348,8 @@ def make_panel(scene_img, instr, role, pair_id):
     for line in textwrap.wrap(instr, width=70)[:4]:
         draw.text((10, y), line, fill=(235, 235, 235), font=font)
         y += 16
-    draw.text((10, SIM_H - 22), pair_id, fill=(120, 120, 120), font=font)
+    draw.text((10, SIM_H - 22), f"{pair_id}  [{frame}]", fill=(120, 120, 120),
+              font=font)
     return panel
 
 
@@ -393,7 +420,9 @@ def main():
             world.step(render=True)
 
     for i, p in enumerate(pairs):
-        print(f"[{i + 1}/{len(pairs)}] {p['pair_id']}")
+        frame = pair_frame(p)
+        stem = output_stem(p)
+        print(f"[{i + 1}/{len(pairs)}] {stem}")
         scene_img = load_scene_image(p)
         if scene_img is None and args.frames_root:
             print("    note: scene image not found; rendering without photo")
@@ -409,7 +438,8 @@ def main():
 
         for role in ("a", "b"):
             go_home()
-            panel = make_panel(scene_img, p[f"instr_{role}"], role, p["pair_id"])
+            panel = make_panel(scene_img, p[f"instr_{role}"], role,
+                               p["pair_id"], frame)
 
             def grab():
                 frames.append(compose(
@@ -441,7 +471,7 @@ def main():
                 world.step(render=True)
                 grab()
 
-        write_video(frames, os.path.join(out_dir, f"{p['pair_id']}.mp4"), args.fps)
+        write_video(frames, os.path.join(out_dir, f"{stem}.mp4"), args.fps)
 
     print(f"[rollout] done -> {out_dir}")
     simulation_app.close()
