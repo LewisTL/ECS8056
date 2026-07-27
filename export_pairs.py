@@ -4,14 +4,18 @@ export_pairs.py: contrastive-pair assembly and export for external visualisation
 Responsibilities:
   * Join the prediction log (written by model.append_prediction_log) with the
     cached BridgeData V2 manifest (written by data.cache_records).
-  * Group predictions into contrastive pairs by pair_id and summarise repeated
-    samples/paraphrases per role as mean and standard deviation.
+  * Group predictions into contrastive pairs by (pair_id, frame) and summarise
+    repeated samples/paraphrases per role as mean and standard deviation.
+    Initial-frame and grasp-frame predictions for the same pair_id are never
+    pooled together.
   * Write the pairs.json consumed by the Isaac Sim visualiser
     (visualise_pairs.py) on the rendering instance.
 
-Prerequisites: the prediction log must carry `pair_id`, `role` ('a' | 'b') and
-`scene_id` columns, supplied via **extra at logging time. `scene_id` must match
-`episode_index` in the manifest for the ground-truth join.
+Prerequisites: the prediction log must carry `pair_id`, `role` ('a' | 'b'),
+`scene_id`, and `frame` ('initial' | 'grasp') columns, supplied via **extra at
+logging time. `scene_id` must match `episode_index` in the manifest for the
+ground-truth join. Logs written before `frame` existed still load: every row
+is treated as `frame='initial'`, with a one-time warning.
 
 Axis-mapping caveat: BRIDGE_TO_ISAAC transforms translation components from the
 Bridge action frame into the Isaac Sim world frame. It defaults to identity and
@@ -30,7 +34,10 @@ import pandas as pd
 # Column names produced by model.append_prediction_log / data.cache_records.
 ACTION_COLS = [f"a{i}" for i in range(7)]
 GT_COLS = ["gt_dx", "gt_dy", "gt_dz", "gt_rx", "gt_ry", "gt_rz", "gt_gripper"]
-REQUIRED_PRED_COLS = {"pair_id", "role", "scene_id", "instruction", *ACTION_COLS}
+# Grasp-frame ground truth is translation-only: rotation and gripper state were
+# never persisted for the post-grasp window (see data.cache_records).
+GRASP_GT_COLS = ["grasp_gt_dx", "grasp_gt_dy", "grasp_gt_dz"]
+REQUIRED_PRED_COLS = {"pair_id", "role", "scene_id", "instruction", "frame", *ACTION_COLS}
 
 # 3x3 mapping from Bridge action axes to Isaac Sim world axes (translation
 # only). Identity until validated in the pilot phase; a swap/flip would look
@@ -60,6 +67,10 @@ def _summarise(group: pd.DataFrame):
 def load_inputs(pred_path: str, manifest_path: str | None = None):
     """Read the prediction log and (optionally) the manifest as DataFrames."""
     preds = pd.read_csv(pred_path)
+    if "frame" not in preds.columns:
+        print("[load_inputs] prediction log has no 'frame' column; "
+              "treating every row as frame='initial'.")
+        preds["frame"] = "initial"
     missing = REQUIRED_PRED_COLS - set(preds.columns)
     if missing:
         raise ValueError(
@@ -76,13 +87,17 @@ def load_inputs(pred_path: str, manifest_path: str | None = None):
 def build_pairs(preds: pd.DataFrame, manifest: pd.DataFrame | None = None):
     """Assemble pair records from the prediction log.
 
-    Returns (pairs, skipped) where `skipped` counts pair_ids lacking both
-    roles. Repeated predictions per role (samples or paraphrases) are averaged;
-    the per-axis standard deviation and count are retained for effect-size and
+    Predictions are grouped by (pair_id, frame): the initial frame is the
+    primary observation for referent_selection scenes and the grasp frame is
+    the decision point for placement_relation scenes, so predictions at the
+    two frames must never be pooled into one record. Returns (pairs, skipped)
+    where `skipped` counts (pair_id, frame) groups lacking both roles.
+    Repeated predictions per role (samples or paraphrases) are averaged; the
+    per-axis standard deviation and count are retained for effect-size and
     variance-cone use downstream.
     """
     pairs, skipped = [], 0
-    for pair_id, grp in preds.groupby("pair_id"):
+    for (pair_id, frame), grp in preds.groupby(["pair_id", "frame"]):
         roles = {r: g for r, g in grp.groupby("role")}
         if not {"a", "b"} <= roles.keys():
             skipped += 1
@@ -95,6 +110,7 @@ def build_pairs(preds: pd.DataFrame, manifest: pd.DataFrame | None = None):
         entry = {
             "scene_id": scene_id,
             "pair_id": pair_id,
+            "frame": frame,
             "start_pos": DEFAULT_START_POS,
             "instr_a": roles["a"]["instruction"].iloc[0],
             "action_a": act_a, "action_a_std": std_a, "n_a": n_a,
@@ -112,9 +128,16 @@ def build_pairs(preds: pd.DataFrame, manifest: pd.DataFrame | None = None):
             m = manifest[manifest["scene_id"] == scene_id]
             if len(m):
                 m0 = m.iloc[0]
-                gt = map_action([float(m0[c]) for c in GT_COLS])
-                entry["gt_vector"] = gt.tolist()
-                entry["image_path"] = m0["image_path"]
+                # Grasp-frame ground truth and image come from the grasp_*
+                # manifest columns; initial-frame ground truth is unchanged.
+                gt_cols, path_col = (
+                    (GRASP_GT_COLS, "grasp_image_path") if frame == "grasp"
+                    else (GT_COLS, "image_path")
+                )
+                if pd.notna(m0.get(path_col)) and all(pd.notna(m0.get(c)) for c in gt_cols):
+                    gt = map_action([float(m0[c]) for c in gt_cols])
+                    entry["gt_vector"] = gt.tolist()
+                    entry["image_path"] = m0[path_col]
                 for col in ("category", "feasible_both"):
                     if col not in entry and col in manifest.columns:
                         entry[col] = str(m0[col])
@@ -142,5 +165,5 @@ if __name__ == "__main__":
     preds, manifest = load_inputs(args.predictions, args.manifest)
     pairs, skipped = build_pairs(preds, manifest)
     if skipped:
-        print(f"[build_pairs] skipped {skipped} pair_ids lacking both roles")
+        print(f"[build_pairs] skipped {skipped} (pair_id, frame) groups lacking both roles")
     write_pairs(pairs, args.out)

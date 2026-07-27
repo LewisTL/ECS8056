@@ -5,6 +5,9 @@ Responsibilities:
   * Stream episodes from the public GCS mirror without a full local download.
   * Extract the initial observation frame, its natural-language instruction, and
     an early-motion ground-truth vector for each episode.
+  * Detect the gripper-close (grasp) step per episode and extract a second
+    observation plus post-grasp ground truth, the decision point for
+    placement_relation scenes.
   * Classify instructions as multi-object / spatially-relational via a transparent
     text heuristic (the pilot filter for multi-object scene selection).
   * Cache the surviving frames plus a manifest to Google Drive as a compact,
@@ -101,56 +104,32 @@ class InstructionTags:
         return "|".join(parts)
 
 
-def _earliest_pos(lowered: str, tokens: list[str], phrases: list[str]) -> int | None:
-    """Character offset of the earliest matched spatial cue, or None."""
-    positions = []
-    for tok in tokens:
-        m = re.search(rf"\b{re.escape(tok)}\b", lowered)
-        if m:
-            positions.append(m.start())
-    for ph in phrases:
-        idx = lowered.find(ph)
-        if idx >= 0:
-            positions.append(idx)
-    return min(positions) if positions else None
-
-
-def _earliest_transfer_verb_pos(lowered: str, word_set: set[str]) -> int | None:
-    """Character offset of the earliest transfer verb, or None."""
-    positions = []
-    for verb in TRANSFER_VERBS & word_set:
-        m = re.search(rf"\b{re.escape(verb)}\b", lowered)
-        if m:
-            positions.append(m.start())
-    return min(positions) if positions else None
-
-
-def _categorise(lowered: str, word_set: set[str],
-                spatial_pos: int | None) -> str:
-    """Assign an instruction category from the spatial cue's role.
+def _categorise(tokens: list[str], phrases: list[str]) -> str:
+    """Assign an instruction category from the shape of the matched spatial cue.
 
     Heuristic (transparent and approximate):
-      * "placement_relation": a transfer verb (put/place/move/stack/set) is
-        present and the spatial cue occurs AFTER it, i.e. the term specifies a
-        destination, e.g. "move the cloth to the right of the colander". This
-        extends the transfer-verb + preposition detection with the spatial
-        term's position relative to the verb phrase.
-      * "referent_selection": a spatial cue is present but the placement test
-        fails, so the term selects which object to act on, e.g. "pick up the
-        cup on the left".
+      * "placement_relation": a destination phrase is present (`to the left`,
+        `to the right`, `next to`, `in front of`, `on top of`, `close to`,
+        `far from`, `between`). A destination phrase names a goal location,
+        e.g. "move the cloth to the right of the colander".
+      * "referent_selection": a spatial cue is present but no destination
+        phrase matched, so the cue is a bare token or a possessive phrase that
+        modifies the object noun phrase instead, e.g. "pick up the cup on the
+        left".
       * "other": no spatial cue.
 
-    Known limitation: a spatial term that selects a referent yet follows a
-    transfer verb (e.g. "put the cup on the left down") is misread as a
-    placement. Categories are annotated, not deleted, so manual review can
-    correct edge cases.
+    Known limitation: an instruction that carries both a referent modifier and
+    a destination phrase (e.g. "put the cup on the left on the shelf") is
+    still misread as placement only, since any matched destination phrase
+    decides the category outright. Categories are annotated, not deleted, so
+    manual review can correct edge cases; `category_manual` exists precisely
+    for this.
     """
-    if spatial_pos is None:
-        return CATEGORY_OTHER
-    verb_pos = _earliest_transfer_verb_pos(lowered, word_set)
-    if verb_pos is not None and spatial_pos > verb_pos:
+    if phrases:
         return CATEGORY_PLACEMENT
-    return CATEGORY_REFERENT
+    if tokens:
+        return CATEGORY_REFERENT
+    return CATEGORY_OTHER
 
 
 def classify_instruction(text: str) -> InstructionTags:
@@ -168,8 +147,7 @@ def classify_instruction(text: str) -> InstructionTags:
     tokens = sorted(SPATIAL_TOKENS & word_set)
     phrases = [p for p in SPATIAL_PHRASES if p in lowered]
     transfer = bool(TRANSFER_VERBS & word_set) and bool(TRANSFER_PREPS & word_set)
-    spatial_pos = _earliest_pos(lowered, tokens, phrases)
-    category = _categorise(lowered, word_set, spatial_pos)
+    category = _categorise(tokens, phrases)
     return InstructionTags(spatial_tokens=tokens, spatial_phrases=phrases,
                            has_transfer=transfer, category=category)
 
@@ -185,6 +163,9 @@ class EpisodeRecord:
     gt_vector: np.ndarray        # float32 (7,): early-motion ground truth
     num_steps: int
     tags: InstructionTags
+    grasp_frame_index: int | None = None
+    grasp_image: np.ndarray | None = None        # uint8 (H, W, 3): grasp-step frame
+    grasp_gt_vector: np.ndarray | None = None    # float32 (7,): post-grasp ground truth
 
 
 def _flatten_action(world_vector, rotation_delta, open_gripper) -> np.ndarray:
@@ -196,18 +177,68 @@ def _flatten_action(world_vector, rotation_delta, open_gripper) -> np.ndarray:
     return vec
 
 
+def _gripper_open(step) -> bool:
+    """Coerce a step's open_gripper action field to a plain bool.
+
+    Accepts a TensorFlow scalar (has `.numpy()`) or a plain Python/NumPy bool,
+    so the same helper works on live BridgeData V2 episodes and on the
+    synthetic steps used in tests.
+    """
+    value = step["action"]["open_gripper"]
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    return bool(value)
+
+
+def grasp_index(steps) -> int | None:
+    """Index of the first step where the gripper transitions open to closed.
+
+    In BridgeData V2, `action['open_gripper']` is True while the gripper is
+    open; the grasp is the first True-to-False transition. Only the first
+    transition is reported; later regrasps are ignored.
+
+    Returns None when the gripper never closes, when it is already closed at
+    the first step (there is no prior open state to transition from), or when
+    the transition falls on the final step, since no step remains to measure
+    post-grasp motion.
+    """
+    n = len(steps)
+    if n < 2:
+        return None
+    prev_open = _gripper_open(steps[0])
+    for i in range(1, n):
+        cur_open = _gripper_open(steps[i])
+        if prev_open and not cur_open:
+            return i if i < n - 1 else None
+        prev_open = cur_open
+    return None
+
+
 def extract_episode(
     episode,
     episode_index: int,
     early_steps: int = 5,
     skip_first_noop: bool = True,
+    post_grasp_steps: int = 5,
 ) -> EpisodeRecord:
-    """Pull the initial frame, instruction, and early-motion ground truth.
+    """Pull the initial frame, instruction, early-motion ground truth, and the
+    grasp-frame observation.
 
-    The initial frame is taken from the first step (the scene the policy observes).
-    The ground-truth vector is the net action summed over the first `early_steps`
-    non-initial steps, because the initial transition in BridgeData V2 is a
-    recorded no-op and carries no directional signal.
+    The initial frame is taken from the first step (the scene the policy
+    observes) and remains the primary observation for referent_selection
+    scenes. The ground-truth vector is the net action summed over the first
+    `early_steps` non-initial steps, because the initial transition in
+    BridgeData V2 is a recorded no-op and carries no directional signal.
+
+    The grasp frame is the step where the gripper first closes (see
+    `grasp_index`): for placement_relation scenes, the two instruction
+    variants demand identical motion until the object is in hand, so the
+    grasp step is the first point where they can diverge. `grasp_gt_vector` is
+    the net action summed over the `post_grasp_steps` steps that follow the
+    grasp index, the transport direction the placement term is supposed to
+    determine. As with the early-motion vector, the gripper component is a
+    state (recorded at the grasp step) rather than a sum. All three grasp
+    fields are None when `grasp_index` returns None.
     """
     steps = list(episode["steps"])
     first = steps[0]
@@ -230,6 +261,24 @@ def extract_episode(
     # sum over the early window.
     gt[IDX_GRIPPER] = float(bool(first["action"]["open_gripper"].numpy()))
 
+    grasp_frame_index = grasp_index(steps)
+    grasp_image = None
+    grasp_gt_vector = None
+    if grasp_frame_index is not None:
+        grasp_step = steps[grasp_frame_index]
+        grasp_image = grasp_step["observation"]["image"].numpy()
+        post_steps = steps[grasp_frame_index + 1: grasp_frame_index + 1 + post_grasp_steps]
+        ggt = np.zeros(7, dtype=np.float32)
+        for step in post_steps:
+            action = step["action"]
+            ggt += _flatten_action(
+                action["world_vector"].numpy(),
+                action["rotation_delta"].numpy(),
+                action["open_gripper"].numpy(),
+            )
+        ggt[IDX_GRIPPER] = float(_gripper_open(grasp_step))
+        grasp_gt_vector = ggt
+
     return EpisodeRecord(
         episode_index=episode_index,
         instruction=instruction,
@@ -237,10 +286,14 @@ def extract_episode(
         gt_vector=gt,
         num_steps=len(steps),
         tags=classify_instruction(instruction),
+        grasp_frame_index=grasp_frame_index,
+        grasp_image=grasp_image,
+        grasp_gt_vector=grasp_gt_vector,
     )
 
 
-def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5):
+def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5,
+                     post_grasp_steps: int = 5):
     """Yield EpisodeRecord objects from the GCS mirror, one episode at a time.
 
     Imported lazily so the TensorFlow/TFDS stack is only required when streaming,
@@ -253,7 +306,8 @@ def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5):
     dataset = builder.as_dataset(split=split)
     for offset, episode in enumerate(dataset):
         yield extract_episode(episode, episode_index=split_start + offset,
-                              early_steps=early_steps)
+                              early_steps=early_steps,
+                              post_grasp_steps=post_grasp_steps)
 
 
 # --------------------------------------------------------------------------- #
@@ -262,11 +316,19 @@ def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5):
 # Default value for the manual feasibility review (see update_manifest_annotations).
 FEASIBLE_DEFAULT = "unreviewed"
 
+# category_source values: the heuristic default, or manual once category_manual
+# is set (see update_manifest_annotations).
+CATEGORY_SOURCE_HEURISTIC = "heuristic"
+CATEGORY_SOURCE_MANUAL = "manual"
+
 MANIFEST_FIELDS = [
     "episode_index", "instruction", "category", "is_multi_object", "has_spatial",
     "has_transfer", "matched_terms", "num_steps", "image_path",
     "feasible_both", "feasibility_note",
     "gt_dx", "gt_dy", "gt_dz", "gt_rx", "gt_ry", "gt_rz", "gt_gripper",
+    "grasp_frame_index", "grasp_image_path",
+    "grasp_gt_dx", "grasp_gt_dy", "grasp_gt_dz",
+    "category_manual", "category_source",
 ]
 
 
@@ -291,6 +353,19 @@ def cache_records(records, out_dir: str, multi_object_only: bool = True) -> str:
             rel = os.path.join("frames", f"ep_{rec.episode_index:06d}.png")
             Image.fromarray(rec.image).save(os.path.join(out_dir, rel))
             gt = rec.gt_vector
+
+            # Grasp fields stay empty when no grasp was detected, matching the
+            # existing convention for unfilled manual-review columns.
+            grasp_frame_index = ""
+            grasp_rel = ""
+            grasp_dx = grasp_dy = grasp_dz = ""
+            if rec.grasp_frame_index is not None:
+                grasp_frame_index = rec.grasp_frame_index
+                grasp_rel = os.path.join("frames", f"ep_{rec.episode_index:06d}_grasp.png")
+                Image.fromarray(rec.grasp_image).save(os.path.join(out_dir, grasp_rel))
+                ggt = rec.grasp_gt_vector
+                grasp_dx, grasp_dy, grasp_dz = ggt[0], ggt[1], ggt[2]
+
             writer.writerow({
                 "episode_index": rec.episode_index,
                 "instruction": rec.instruction,
@@ -307,6 +382,11 @@ def cache_records(records, out_dir: str, multi_object_only: bool = True) -> str:
                 "gt_dx": gt[0], "gt_dy": gt[1], "gt_dz": gt[2],
                 "gt_rx": gt[3], "gt_ry": gt[4], "gt_rz": gt[5],
                 "gt_gripper": gt[6],
+                "grasp_frame_index": grasp_frame_index,
+                "grasp_image_path": grasp_rel,
+                "grasp_gt_dx": grasp_dx, "grasp_gt_dy": grasp_dy, "grasp_gt_dz": grasp_dz,
+                "category_manual": "",
+                "category_source": CATEGORY_SOURCE_HEURISTIC,
             })
             written += 1
     print(f"[cache_records] wrote {written} frames + manifest to {out_dir}")
@@ -314,24 +394,46 @@ def cache_records(records, out_dir: str, multi_object_only: bool = True) -> str:
 
 
 def load_manifest(out_dir: str):
-    """Read a cached manifest back as a list of row dicts (no image decoding)."""
+    """Read a cached manifest back as a list of row dicts (no image decoding).
+
+    Tolerates manifests written before a column was added to MANIFEST_FIELDS:
+    every row is normalised to the current field set, with missing columns
+    read as an empty string rather than raising a KeyError downstream.
+    """
     manifest_path = os.path.join(out_dir, "manifest.csv")
     with open(manifest_path, newline="") as f:
-        return list(csv.DictReader(f))
+        rows = list(csv.DictReader(f))
+    return [{col: row.get(col, "") for col in MANIFEST_FIELDS} for row in rows]
+
+
+# Fields update_manifest_annotations may write. Setting category_manual always
+# sets category_source to CATEGORY_SOURCE_MANUAL in the same call.
+ANNOTATION_FIELDS = frozenset({
+    "feasible_both", "feasibility_note", "category_manual", "category_source",
+})
 
 
 def update_manifest_annotations(out_dir: str, annotations: dict) -> str:
-    """Rewrite the manifest with manual feasibility annotations filled in.
+    """Rewrite the manifest with manual annotations filled in.
 
     Annotates rather than deletes: contrastive prompts built by antonym swap can
     imply physically infeasible placements, so each scene is reviewed for whether
-    the implied placement is possible on BOTH sides of the referent.
+    the implied placement is possible on BOTH sides of the referent. The same
+    reviewed path also carries manual category correction, since a spatial term
+    that both selects a referent and names a destination is misread by
+    `_categorise`; the heuristic `category` column is never overwritten, and
+    downstream code reads `category_manual` when populated, falling back to
+    `category`.
 
     Args:
         out_dir: directory holding manifest.csv.
-        annotations: {episode_index: {"feasible_both": "yes"|"no"|"unclear",
-            "feasibility_note": str}}. Keys may be int or str; only the provided
-            fields are overwritten, other rows keep their existing values.
+        annotations: {episode_index: {field: value, ...}}, where field is one
+            of ANNOTATION_FIELDS (`feasible_both`, `feasibility_note`,
+            `category_manual`, `category_source`). Keys may be int or str;
+            only the provided fields are overwritten, other rows and other
+            fields keep their existing values. Setting `category_manual` sets
+            `category_source` to `manual` regardless of any explicit
+            `category_source` value passed in the same note.
 
     Returns the manifest path.
     """
@@ -345,11 +447,15 @@ def update_manifest_annotations(out_dir: str, annotations: dict) -> str:
         note = ann.get(str(row["episode_index"]))
         if not note:
             continue
-        if "feasible_both" in note:
-            row["feasible_both"] = note["feasible_both"]
-        if "feasibility_note" in note:
-            row["feasibility_note"] = note["feasibility_note"]
-        updated += 1
+        touched = False
+        for field_name in ANNOTATION_FIELDS:
+            if field_name in note:
+                row[field_name] = note[field_name]
+                touched = True
+        if "category_manual" in note:
+            row["category_source"] = CATEGORY_SOURCE_MANUAL
+        if touched:
+            updated += 1
 
     with open(manifest_path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
