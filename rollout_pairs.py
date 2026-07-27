@@ -23,9 +23,13 @@ Render one pair by scene_id or pair_id (prefix and epNN shorthand accepted):
     ./python.sh ~/rollout_pairs.py --pairs ~/pairs.json --out ~/rollouts \
         --frames-root ~/bridge_frames --pair-id ep000000
 
-Grasp-frame placement pairs (post-grasp observation):
-    ./python.sh ~/rollout_pairs.py --pairs ~/pairs.json --out ~/rollouts \
-        --frames-root ~/bridge_frames --frame grasp --pair-id ep000000
+Grasp-frame placement pairs (post-grasp observation). Use `--frame` (singular);
+`--frames` is not a flag and used to be misread as `--frames-root`:
+
+```
+./python.sh ~/rollout_pairs.py --pairs ~/pairs.json --out ~/rollouts \
+    --frames-root ~/bridge_frames --frame grasp --pair-id ep000000
+```
 
 --frames-root points at the cached BridgeData frames (copy once with e.g.
 `rclone copy gdrive:openvla_cache/bridge_multiobj/frames ~/bridge_frames`).
@@ -50,7 +54,7 @@ except ImportError:
     map_action = None
     BRIDGE_TO_ISAAC = None
 
-ap = argparse.ArgumentParser()
+ap = argparse.ArgumentParser(allow_abbrev=False)
 ap.add_argument("--pairs", required=True)
 ap.add_argument("--out", default="./rollouts")
 ap.add_argument("--frames-root", default=None,
@@ -62,7 +66,7 @@ ap.add_argument("--pair-id", nargs="+", default=None,
                      "or epNN / NN shorthand (e.g. ep70 -> ep000070_*)")
 ap.add_argument("--frame", nargs="+", choices=("initial", "grasp"), default=None,
                 help="render only pairs at these observation frames "
-                     "(e.g. --frame grasp for post-grasp placement pairs)")
+                     "(use --frame grasp, not --frames)")
 ap.add_argument("--list", action="store_true",
                 help="print available pair_id / scene_id / frame values and exit "
                      "(does not launch Isaac Sim)")
@@ -153,11 +157,25 @@ if args.list:
 if not pairs:
     filtered = (args.scene_id is not None or args.pair_id is not None
                 or args.frame is not None or args.limit)
+    from collections import Counter
+    frame_counts = Counter(pair_frame(p) for p in all_pairs)
+    missing_field = sum(1 for p in all_pairs if "frame" not in p)
     msg = ["[rollout] no pairs matched the given filters "
            f"(scene-id={args.scene_id}, pair-id={args.pair_id}, "
            f"frame={args.frame}, limit={args.limit})",
+           f"[rollout] frame counts in file: {dict(frame_counts)} "
+           f"({missing_field} records lack a 'frame' field and default to "
+           f"'initial')",
            f"[rollout] {len(all_pairs)} pairs available:"]
-    msg.append(format_pair_index(all_pairs))
+    msg.append(format_pair_index(all_pairs[:40]))
+    if len(all_pairs) > 40:
+        msg.append(f"  ... and {len(all_pairs) - 40} more")
+    if args.frame and "grasp" in args.frame and frame_counts.get("grasp", 0) == 0:
+        msg.append(
+            "[rollout] this pairs.json has no grasp-frame records. Re-export "
+            "from Notebook 04 using probe_predictions_v3.csv (two-frame probe), "
+            "then copy the new pairs.json to the rendering instance. "
+            "Also use --frame grasp (singular), not --frames.")
     if filtered:
         msg.append("[rollout] re-run with --list, or pass a pair_id / scene_id / "
                    "frame from the list above")
@@ -309,15 +327,46 @@ class Trail:
         self.i = 0
 
 
+def scene_image_candidates(p, frames_root):
+    """Return filesystem paths to try for the pair's BridgeData photo."""
+    root = os.path.expanduser(frames_root)
+    names = []
+    if p.get("image_path"):
+        rel = str(p["image_path"])
+        names.extend([rel, os.path.basename(rel)])
+        # Common layout: frames-root is already the frames/ directory.
+        if rel.startswith("frames" + os.sep) or rel.startswith("frames/"):
+            names.append(rel.split("/", 1)[-1].split("\\", 1)[-1])
+    # Fallback from scene_id + observation frame when image_path is missing
+    # (older exports only attached image_path when GT columns were complete).
+    try:
+        ep = int(p["scene_id"])
+        frame = pair_frame(p)
+        stem = f"ep_{ep:06d}_grasp.png" if frame == "grasp" else f"ep_{ep:06d}.png"
+        names.extend([stem, os.path.join("frames", stem)])
+    except (KeyError, TypeError, ValueError):
+        pass
+    cands = []
+    seen = set()
+    for name in names:
+        path = os.path.join(root, name)
+        if path not in seen:
+            seen.add(path)
+            cands.append(path)
+    return cands
+
+
 def load_scene_image(p):
     """Locate and load the pair's BridgeData frame, or None."""
-    if not args.frames_root or "image_path" not in p:
+    if not args.frames_root:
         return None
-    root = os.path.expanduser(args.frames_root)
-    for cand in (os.path.join(root, p["image_path"]),
-                 os.path.join(root, os.path.basename(p["image_path"]))):
+    cands = scene_image_candidates(p, args.frames_root)
+    for cand in cands:
         if os.path.exists(cand):
             return Image.open(cand).convert("RGB")
+    if cands:
+        print(f"    note: scene image not found; tried {cands[0]}"
+              + (f" (+{len(cands) - 1} more)" if len(cands) > 1 else ""))
     return None
 
 
@@ -424,8 +473,6 @@ def main():
         stem = output_stem(p)
         print(f"[{i + 1}/{len(pairs)}] {stem}")
         scene_img = load_scene_image(p)
-        if scene_img is None and args.frames_root:
-            print("    note: scene image not found; rendering without photo")
         trails["a"].clear()
         trails["b"].clear()
         frames = []

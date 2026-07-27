@@ -130,14 +130,19 @@ def build_pairs(preds: pd.DataFrame, manifest: pd.DataFrame | None = None):
                 m0 = m.iloc[0]
                 # Grasp-frame ground truth and image come from the grasp_*
                 # manifest columns; initial-frame ground truth is unchanged.
+                # Attach the image whenever the path is present, even if the
+                # corresponding ground-truth vector is incomplete, so rollouts
+                # can still show the BridgeData photo.
                 gt_cols, path_col = (
                     (GRASP_GT_COLS, "grasp_image_path") if frame == "grasp"
                     else (GT_COLS, "image_path")
                 )
-                if pd.notna(m0.get(path_col)) and all(pd.notna(m0.get(c)) for c in gt_cols):
+                path_val = m0.get(path_col)
+                if pd.notna(path_val) and str(path_val).strip():
+                    entry["image_path"] = str(path_val)
+                if all(pd.notna(m0.get(c)) for c in gt_cols):
                     gt = map_action([float(m0[c]) for c in gt_cols])
                     entry["gt_vector"] = gt.tolist()
-                    entry["image_path"] = m0[path_col]
                 for col in ("category", "feasible_both"):
                     if col not in entry and col in manifest.columns:
                         entry[col] = str(m0[col])
