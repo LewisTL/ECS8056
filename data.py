@@ -12,6 +12,8 @@ Responsibilities:
     text heuristic (the pilot filter for multi-object scene selection).
   * Cache the surviving frames plus a manifest to Google Drive as a compact,
     reproducible evaluation set.
+  * Build antonym-swapped minimal pairs and queue scenes for iterative manual
+    feasibility review.
 
 Schema notes (confirmed against gs://gresearch/robotics/bridge/0.1.0/):
   * observation['image']                       uint8  (480, 640, 3)
@@ -311,8 +313,51 @@ def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5,
 
 
 # --------------------------------------------------------------------------- #
+# Antonym-swapped minimal pairs
+# --------------------------------------------------------------------------- #
+# Longer phrases first so the compiled regex prefers "in front of" over "front".
+ANTONYM_PAIRS = [
+    ("in front of", "behind"),
+    ("closer to", "farther from"),
+    ("nearer to", "farther from"),
+    ("leftmost", "rightmost"),
+    ("nearest", "farthest"),
+    ("left", "right"),
+    ("top", "bottom"),
+    ("front", "back"),
+]
+
+SWAP: dict[str, str] = {}
+for _a, _b in ANTONYM_PAIRS:
+    SWAP.setdefault(_a, _b)
+    SWAP.setdefault(_b, _a)
+
+_SWAP_KEYS = sorted(SWAP, key=len, reverse=True)
+_SWAP_RE = re.compile(
+    r"\b(" + "|".join(re.escape(k) for k in _SWAP_KEYS) + r")\b",
+    re.IGNORECASE,
+)
+
+
+def make_pair(instruction: str):
+    """Return (term, swapped) if exactly one swappable spatial phrase occurs.
+
+    Instructions with zero or multiple swappable terms return None, so a
+    multi-term swap cannot break the minimal-pair property.
+    """
+    hits = _SWAP_RE.findall(instruction)
+    if len(hits) != 1:
+        return None
+    term = hits[0].lower()
+    swapped = _SWAP_RE.sub(lambda m: SWAP[m.group(0).lower()], instruction)
+    return term, swapped
+
+
+# --------------------------------------------------------------------------- #
 # Drive cache (filtered survivors only)
 # --------------------------------------------------------------------------- #
+# Allowed values for the manual feasibility review field.
+FEASIBLE_VALUES = frozenset({"yes", "no", "unclear", "unreviewed"})
 # Default value for the manual feasibility review (see update_manifest_annotations).
 FEASIBLE_DEFAULT = "unreviewed"
 
@@ -433,7 +478,8 @@ def update_manifest_annotations(out_dir: str, annotations: dict) -> str:
             only the provided fields are overwritten, other rows and other
             fields keep their existing values. Setting `category_manual` sets
             `category_source` to `manual` regardless of any explicit
-            `category_source` value passed in the same note.
+            `category_source` value passed in the same note. A `feasible_both`
+            value outside FEASIBLE_VALUES raises ValueError.
 
     Returns the manifest path.
     """
@@ -441,6 +487,13 @@ def update_manifest_annotations(out_dir: str, annotations: dict) -> str:
     rows = load_manifest(out_dir)
     # Normalise keys to strings so int/str episode indices both match.
     ann = {str(k): v for k, v in annotations.items()}
+
+    for ep_key, note in ann.items():
+        if "feasible_both" in note and note["feasible_both"] not in FEASIBLE_VALUES:
+            raise ValueError(
+                f"feasible_both for episode {ep_key} must be one of "
+                f"{sorted(FEASIBLE_VALUES)}, got {note['feasible_both']!r}"
+            )
 
     updated = 0
     for row in rows:
@@ -464,3 +517,135 @@ def update_manifest_annotations(out_dir: str, annotations: dict) -> str:
             writer.writerow({k: row.get(k, "") for k in MANIFEST_FIELDS})
     print(f"[update_manifest_annotations] updated {updated} rows in {manifest_path}")
     return manifest_path
+
+
+def _effective_category(row: dict) -> str:
+    """Return category_manual when set, otherwise the heuristic category."""
+    return row.get("category_manual") or row.get("category") or CATEGORY_OTHER
+
+
+def _review_item(row: dict) -> dict:
+    """Build a review-queue record from a manifest row."""
+    instruction = row.get("instruction", "")
+    made = make_pair(instruction)
+    if made is None:
+        term, instr_b, pairable = "", "", False
+    else:
+        term, instr_b = made
+        pairable = True
+    return {
+        "episode_index": row["episode_index"],
+        "category": _effective_category(row),
+        "instruction": instruction,
+        "instr_b": instr_b,
+        "spatial_term": term,
+        "pairable": pairable,
+        "image_path": row.get("image_path", ""),
+        "grasp_image_path": row.get("grasp_image_path", ""),
+        "feasible_both": row.get("feasible_both") or FEASIBLE_DEFAULT,
+        "feasibility_note": row.get("feasibility_note", ""),
+        "category_manual": row.get("category_manual", ""),
+    }
+
+
+def review_summary(out_dir: str) -> dict:
+    """Summarise feasibility review progress for a cached manifest.
+
+    Returns a dict with:
+      * `by_category_feasibility`: {(category, feasible_both): count}
+      * `pairable`: count of scenes with a valid antonym pair
+      * `non_pairable`: count of scenes without a valid antonym pair
+      * `referent_pairable_unreviewed`: pairable referent_selection still unreviewed
+      * `referent_pairable_yes`: pairable referent_selection marked feasible
+    """
+    rows = load_manifest(out_dir)
+    by_cat_feas: dict[tuple[str, str], int] = {}
+    pairable = 0
+    non_pairable = 0
+    referent_unreviewed = 0
+    referent_yes = 0
+    for row in rows:
+        item = _review_item(row)
+        key = (item["category"], item["feasible_both"])
+        by_cat_feas[key] = by_cat_feas.get(key, 0) + 1
+        if item["pairable"]:
+            pairable += 1
+            if item["category"] == CATEGORY_REFERENT:
+                if item["feasible_both"] == "unreviewed":
+                    referent_unreviewed += 1
+                elif item["feasible_both"] == "yes":
+                    referent_yes += 1
+        else:
+            non_pairable += 1
+    return {
+        "by_category_feasibility": by_cat_feas,
+        "pairable": pairable,
+        "non_pairable": non_pairable,
+        "referent_pairable_unreviewed": referent_unreviewed,
+        "referent_pairable_yes": referent_yes,
+        "total": len(rows),
+    }
+
+
+def review_queue(
+    out_dir: str,
+    *,
+    status: str | None = "unreviewed",
+    categories: list[str] | None = None,
+    only_pairable: bool = True,
+    limit: int | None = None,
+) -> list[dict]:
+    """Return an ordered list of scenes for manual feasibility review.
+
+    Priority order:
+      1. referent_selection, pairable, matching status
+      2. placement_relation with a grasp frame, pairable, matching status
+      3. remaining pairable spatial scenes matching status
+      4. non-pairable scenes only when only_pairable is False
+
+    Args:
+        out_dir: directory holding manifest.csv and frames/.
+        status: filter on feasible_both; None keeps every status. Must be a
+            member of FEASIBLE_VALUES when set.
+        categories: optional allow-list of effective categories; None keeps all.
+        only_pairable: when True, drop scenes that do not form a minimal pair.
+        limit: optional maximum number of items to return.
+    """
+    if status is not None and status not in FEASIBLE_VALUES:
+        raise ValueError(
+            f"status must be one of {sorted(FEASIBLE_VALUES)} or None, "
+            f"got {status!r}"
+        )
+    cat_allow = set(categories) if categories is not None else None
+
+    items = [_review_item(row) for row in load_manifest(out_dir)]
+    if status is not None:
+        items = [it for it in items if it["feasible_both"] == status]
+    if cat_allow is not None:
+        items = [it for it in items if it["category"] in cat_allow]
+    if only_pairable:
+        items = [it for it in items if it["pairable"]]
+
+    def _priority(it: dict) -> tuple:
+        cat = it["category"]
+        has_grasp = bool(it["grasp_image_path"])
+        pairable = it["pairable"]
+        if pairable and cat == CATEGORY_REFERENT:
+            bucket = 0
+        elif pairable and cat == CATEGORY_PLACEMENT and has_grasp:
+            bucket = 1
+        elif pairable:
+            bucket = 2
+        else:
+            bucket = 3
+        # Stable secondary key by episode index for resume-friendly order.
+        try:
+            ep = int(it["episode_index"])
+        except (TypeError, ValueError):
+            ep = 0
+        return (bucket, ep)
+
+    items.sort(key=_priority)
+    if limit is not None:
+        items = items[:limit]
+    return items
