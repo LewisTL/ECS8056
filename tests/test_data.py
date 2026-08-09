@@ -16,6 +16,8 @@ from data import (
     CATEGORY_PLACEMENT,
     CATEGORY_REFERENT,
     CATEGORY_SOURCE_HEURISTIC,
+    DUPLICATE_SOURCE_AUTO,
+    DUPLICATE_SOURCE_MANUAL,
     FEASIBLE_DEFAULT,
     MANIFEST_FIELDS,
     _categorise,
@@ -26,6 +28,7 @@ from data import (
     review_summary,
     update_manifest_annotations,
 )
+from detect_duplicates import classify_counts, extract_target_noun
 
 
 def _step(open_gripper: bool) -> dict:
@@ -189,6 +192,7 @@ def test_review_summary_counts(tmp_path):
             "instruction": "pick up the cup on the right",
             "category": CATEGORY_REFERENT,
             "feasible_both": "yes",
+            "duplicate_target": "yes",
         },
         {
             "episode_index": "3",
@@ -204,6 +208,35 @@ def test_review_summary_counts(tmp_path):
     assert summary["referent_pairable_unreviewed"] == 1
     assert summary["referent_pairable_yes"] == 1
     assert summary["by_category_feasibility"][(CATEGORY_REFERENT, "yes")] == 1
+    # Episode 2 is referent, pairable, feasible on both sides, and duplicate.
+    assert summary["primary_eligible"] == 1
+    assert summary["referent_pairable_dup_yes"] == 1
+    assert summary["referent_pairable_dup_unreviewed"] == 1
+
+
+def test_review_queue_duplicate_status_filter(tmp_path):
+    out_dir = _write_manifest(tmp_path, [
+        {
+            "episode_index": "1",
+            "instruction": "pick up the cup on the left",
+            "category": CATEGORY_REFERENT,
+            "image_path": "frames/ep_000001.png",
+            "feasible_both": "unreviewed",
+            "duplicate_target": "unclear",
+        },
+        {
+            "episode_index": "2",
+            "instruction": "pick up the cup on the right",
+            "category": CATEGORY_REFERENT,
+            "image_path": "frames/ep_000002.png",
+            "feasible_both": "unreviewed",
+            "duplicate_target": "yes",
+        },
+    ])
+    # Status=None keeps every feasibility value; the duplicate filter selects
+    # only the auto-flagged borderline scene.
+    unclear = review_queue(out_dir, status=None, duplicate_status="unclear")
+    assert [int(it["episode_index"]) for it in unclear] == [1]
 
 
 def test_update_manifest_annotations_rejects_bad_feasible(tmp_path):
@@ -217,3 +250,67 @@ def test_update_manifest_annotations_rejects_bad_feasible(tmp_path):
     ])
     with pytest.raises(ValueError, match="feasible_both"):
         update_manifest_annotations(out_dir, {1: {"feasible_both": "maybe"}})
+
+
+def test_update_manifest_annotations_rejects_bad_duplicate(tmp_path):
+    out_dir = _write_manifest(tmp_path, [
+        {
+            "episode_index": "1",
+            "instruction": "pick up the cup on the left",
+            "category": CATEGORY_REFERENT,
+            "feasible_both": "unreviewed",
+        },
+    ])
+    with pytest.raises(ValueError, match="duplicate_target"):
+        update_manifest_annotations(out_dir, {1: {"duplicate_target": "maybe"}})
+
+
+def test_update_manifest_annotations_writes_duplicate_source(tmp_path):
+    out_dir = _write_manifest(tmp_path, [
+        {
+            "episode_index": "1",
+            "instruction": "pick up the cup on the left",
+            "category": CATEGORY_REFERENT,
+            "feasible_both": "unreviewed",
+        },
+        {
+            "episode_index": "2",
+            "instruction": "pick up the cup on the right",
+            "category": CATEGORY_REFERENT,
+            "feasible_both": "unreviewed",
+        },
+    ])
+    update_manifest_annotations(out_dir, {
+        1: {"duplicate_target": "yes", "duplicate_source": DUPLICATE_SOURCE_AUTO},
+        2: {"duplicate_target": "no", "duplicate_source": DUPLICATE_SOURCE_MANUAL},
+    })
+    items = {int(it["episode_index"]): it
+             for it in review_queue(out_dir, status=None, only_pairable=False)}
+    assert items[1]["duplicate_target"] == "yes"
+    assert items[1]["duplicate_source"] == DUPLICATE_SOURCE_AUTO
+    assert items[2]["duplicate_target"] == "no"
+    assert items[2]["duplicate_source"] == DUPLICATE_SOURCE_MANUAL
+
+
+def test_classify_counts_bands():
+    # Two confident detections above the high threshold -> duplicate.
+    label, conf = classify_counts([0.9, 0.8, 0.2], high=0.3, low=0.15)
+    assert label == "yes"
+    assert conf == 0.8
+    # A single strong detection with no credible second instance -> single.
+    label, conf = classify_counts([0.9, 0.05], high=0.3, low=0.15)
+    assert label == "no"
+    # A borderline second detection -> left for manual confirmation.
+    label, _ = classify_counts([0.9, 0.2], high=0.3, low=0.15)
+    assert label == "unclear"
+    # No detections at all -> single target.
+    label, conf = classify_counts([], high=0.3, low=0.15)
+    assert label == "no"
+    assert conf == 0.0
+
+
+def test_extract_target_noun():
+    # The object selected by the spatial term, not the location word.
+    assert extract_target_noun("pick up the cup on the left") == "cup"
+    assert extract_target_noun("grab the red block on the right") == "block"
+    assert extract_target_noun("") is None

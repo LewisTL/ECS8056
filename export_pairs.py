@@ -16,12 +16,6 @@ Prerequisites: the prediction log must carry `pair_id`, `role` ('a' | 'b'),
 logging time. `scene_id` must match `episode_index` in the manifest for the
 ground-truth join. Logs written before `frame` existed still load: every row
 is treated as `frame='initial'`, with a one-time warning.
-
-Axis-mapping caveat: BRIDGE_TO_ISAAC transforms translation components from the
-Bridge action frame into the Isaac Sim world frame. It defaults to identity and
-must be set from the pilot validation (sign agreement against gt_vector) before
-rendered figures are treated as meaningful. The same matrix is applied to the
-ground-truth vectors so predicted and reference arrows share a frame.
 """
 
 from __future__ import annotations
@@ -120,7 +114,7 @@ def build_pairs(preds: pd.DataFrame, manifest: pd.DataFrame | None = None):
 
         # Carry stratification fields through for downstream analysis. Prefer the
         # probe log (logged per prediction), falling back to the manifest.
-        for col in ("category", "feasible_both", "spatial_term"):
+        for col in ("category", "feasible_both", "duplicate_target", "spatial_term"):
             if col in grp.columns:
                 entry[col] = str(grp[col].iloc[0])
 
@@ -143,7 +137,7 @@ def build_pairs(preds: pd.DataFrame, manifest: pd.DataFrame | None = None):
                 if all(pd.notna(m0.get(c)) for c in gt_cols):
                     gt = map_action([float(m0[c]) for c in gt_cols])
                     entry["gt_vector"] = gt.tolist()
-                for col in ("category", "feasible_both"):
+                for col in ("category", "feasible_both", "duplicate_target"):
                     if col not in entry and col in manifest.columns:
                         entry[col] = str(m0[col])
 

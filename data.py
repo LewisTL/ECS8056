@@ -1,5 +1,5 @@
 """
-data.py: BridgeData V2 (Open X-Embodiment mirror) loading and scene filtering.
+data.py: BridgeData V2 loading and scene filtering.
 
 Responsibilities:
   * Stream episodes from the public GCS mirror without a full local download.
@@ -23,11 +23,6 @@ Schema notes (confirmed against gs://gresearch/robotics/bridge/0.1.0/):
     terminate_episode (float). The flat 7-vector layout used here is
     [world_vector(3), rotation_delta(3), gripper(1)], mirroring the OpenVLA output
     layout [dx, dy, dz, droll, dpitch, dyaw, gripper].
-
-Convention caveat: ground-truth actions follow the OXE convention, whereas model
-predictions are de-normalised with unnorm_key='bridge_orig'. Magnitudes are NOT
-directly comparable across the two; the directional-consistency metric relies on
-the SIGN of the translation components, which is convention-invariant.
 """
 
 from __future__ import annotations
@@ -303,7 +298,34 @@ def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5,
     """
     import tensorflow_datasets as tfds
 
-    builder = tfds.builder_from_directory(BRIDGE_GCS)
+    # `builder_from_directory` is a re-export whose public aliases
+    # (`tfds.builder_from_directory`, `tfds.core.builder_from_directory`) are
+    # absent in some TFDS builds. It is defined in
+    # `tensorflow_datasets.core.read_only_builder`, so fall back to importing it
+    # from there before giving up.
+    builder_from_directory = getattr(tfds, "builder_from_directory", None)
+    if builder_from_directory is None:
+        builder_from_directory = getattr(
+            getattr(tfds, "core", None), "builder_from_directory", None)
+    if builder_from_directory is None:
+        try:
+            from tensorflow_datasets.core.read_only_builder import (
+                builder_from_directory,
+            )
+        except ImportError:
+            builder_from_directory = None
+    if builder_from_directory is None:
+        raise AttributeError(
+            "tensorflow_datasets exposes no builder_from_directory in this "
+            "environment. Do not upgrade tensorflow_datasets on managed "
+            "runtimes such as Colab: newer tensorflow-metadata ships protobuf 6 "
+            "gencode that the pinned protobuf 5 runtime rejects. Instead pin a "
+            "protobuf 5 compatible stack, for example "
+            "`pip install \"tensorflow-datasets==4.9.7\" "
+            "\"tensorflow-metadata==1.16.1\"`, then restart the runtime."
+        )
+
+    builder = builder_from_directory(BRIDGE_GCS)
     split = f"train[{split_start}:{split_start + n}]"
     dataset = builder.as_dataset(split=split)
     for offset, episode in enumerate(dataset):
@@ -361,15 +383,28 @@ FEASIBLE_VALUES = frozenset({"yes", "no", "unclear", "unreviewed"})
 # Default value for the manual feasibility review (see update_manifest_annotations).
 FEASIBLE_DEFAULT = "unreviewed"
 
+# Allowed values for the duplicate-target field. A scene is a clean referent
+# probe only when it contains two or more instances of the same object, so the
+# antonym-swapped instruction names a distinct, real target on both sides.
+DUPLICATE_VALUES = frozenset({"yes", "no", "unclear", "unreviewed"})
+# Default value for the duplicate-target field before any proposal or review.
+DUPLICATE_DEFAULT = "unreviewed"
+
 # category_source values: the heuristic default, or manual once category_manual
 # is set (see update_manifest_annotations).
 CATEGORY_SOURCE_HEURISTIC = "heuristic"
 CATEGORY_SOURCE_MANUAL = "manual"
 
+# duplicate_source values: empty before any label, `auto` when written by the
+# open-vocabulary detector pass, or `manual` when confirmed in manual review.
+DUPLICATE_SOURCE_AUTO = "auto"
+DUPLICATE_SOURCE_MANUAL = "manual"
+
 MANIFEST_FIELDS = [
     "episode_index", "instruction", "category", "is_multi_object", "has_spatial",
     "has_transfer", "matched_terms", "num_steps", "image_path",
     "feasible_both", "feasibility_note",
+    "duplicate_target", "duplicate_note", "duplicate_source", "duplicate_score",
     "gt_dx", "gt_dy", "gt_dz", "gt_rx", "gt_ry", "gt_rz", "gt_gripper",
     "grasp_frame_index", "grasp_image_path",
     "grasp_gt_dx", "grasp_gt_dy", "grasp_gt_dz",
@@ -424,6 +459,12 @@ def cache_records(records, out_dir: str, multi_object_only: bool = True) -> str:
                 # Feasibility is filled in later by manual review, not deleted.
                 "feasible_both": FEASIBLE_DEFAULT,
                 "feasibility_note": "",
+                # Duplicate-target is filled in later by the automated proposal
+                # pass and manual confirmation, not deleted.
+                "duplicate_target": DUPLICATE_DEFAULT,
+                "duplicate_note": "",
+                "duplicate_source": "",
+                "duplicate_score": "",
                 "gt_dx": gt[0], "gt_dy": gt[1], "gt_dz": gt[2],
                 "gt_rx": gt[3], "gt_ry": gt[4], "gt_rz": gt[5],
                 "gt_gripper": gt[6],
@@ -452,9 +493,12 @@ def load_manifest(out_dir: str):
 
 
 # Fields update_manifest_annotations may write. Setting category_manual always
-# sets category_source to CATEGORY_SOURCE_MANUAL in the same call.
+# sets category_source to CATEGORY_SOURCE_MANUAL in the same call. The
+# duplicate_source is written explicitly by the caller (the auto pass passes
+# `auto`, the review UI passes `manual`).
 ANNOTATION_FIELDS = frozenset({
     "feasible_both", "feasibility_note", "category_manual", "category_source",
+    "duplicate_target", "duplicate_note", "duplicate_source", "duplicate_score",
 })
 
 
@@ -474,12 +518,16 @@ def update_manifest_annotations(out_dir: str, annotations: dict) -> str:
         out_dir: directory holding manifest.csv.
         annotations: {episode_index: {field: value, ...}}, where field is one
             of ANNOTATION_FIELDS (`feasible_both`, `feasibility_note`,
-            `category_manual`, `category_source`). Keys may be int or str;
-            only the provided fields are overwritten, other rows and other
-            fields keep their existing values. Setting `category_manual` sets
-            `category_source` to `manual` regardless of any explicit
-            `category_source` value passed in the same note. A `feasible_both`
-            value outside FEASIBLE_VALUES raises ValueError.
+            `category_manual`, `category_source`, `duplicate_target`,
+            `duplicate_note`, `duplicate_source`, `duplicate_score`). Keys may
+            be int or str; only the provided fields are overwritten, other rows
+            and other fields keep their existing values. Setting
+            `category_manual` sets `category_source` to `manual` regardless of
+            any explicit `category_source` value passed in the same note. A
+            `feasible_both` value outside FEASIBLE_VALUES or a
+            `duplicate_target` value outside DUPLICATE_VALUES raises ValueError.
+            `duplicate_source` is written as provided (the auto pass passes
+            `auto`, the review UI passes `manual`).
 
     Returns the manifest path.
     """
@@ -493,6 +541,11 @@ def update_manifest_annotations(out_dir: str, annotations: dict) -> str:
             raise ValueError(
                 f"feasible_both for episode {ep_key} must be one of "
                 f"{sorted(FEASIBLE_VALUES)}, got {note['feasible_both']!r}"
+            )
+        if "duplicate_target" in note and note["duplicate_target"] not in DUPLICATE_VALUES:
+            raise ValueError(
+                f"duplicate_target for episode {ep_key} must be one of "
+                f"{sorted(DUPLICATE_VALUES)}, got {note['duplicate_target']!r}"
             )
 
     updated = 0
@@ -544,6 +597,10 @@ def _review_item(row: dict) -> dict:
         "grasp_image_path": row.get("grasp_image_path", ""),
         "feasible_both": row.get("feasible_both") or FEASIBLE_DEFAULT,
         "feasibility_note": row.get("feasibility_note", ""),
+        "duplicate_target": row.get("duplicate_target") or DUPLICATE_DEFAULT,
+        "duplicate_note": row.get("duplicate_note", ""),
+        "duplicate_source": row.get("duplicate_source", ""),
+        "duplicate_score": row.get("duplicate_score", ""),
         "category_manual": row.get("category_manual", ""),
     }
 
@@ -557,6 +614,16 @@ def review_summary(out_dir: str) -> dict:
       * `non_pairable`: count of scenes without a valid antonym pair
       * `referent_pairable_unreviewed`: pairable referent_selection still unreviewed
       * `referent_pairable_yes`: pairable referent_selection marked feasible
+      * `referent_pairable_dup_unreviewed`: pairable referent_selection whose
+        duplicate_target is still unreviewed
+      * `referent_pairable_dup_yes`: pairable referent_selection with two or more
+        identical objects (duplicate_target == 'yes')
+      * `referent_pairable_dup_unclear`: pairable referent_selection whose
+        duplicate_target is unclear and awaiting confirmation
+      * `duplicate_source`: {source: count} across pairable referent_selection
+        scenes, showing how many labels came from the auto pass versus review
+      * `primary_eligible`: pairable referent_selection scenes that satisfy the
+        headline stratum (feasible_both == 'yes' and duplicate_target == 'yes')
     """
     rows = load_manifest(out_dir)
     by_cat_feas: dict[tuple[str, str], int] = {}
@@ -564,6 +631,11 @@ def review_summary(out_dir: str) -> dict:
     non_pairable = 0
     referent_unreviewed = 0
     referent_yes = 0
+    referent_dup_unreviewed = 0
+    referent_dup_yes = 0
+    referent_dup_unclear = 0
+    dup_source: dict[str, int] = {}
+    primary_eligible = 0
     for row in rows:
         item = _review_item(row)
         key = (item["category"], item["feasible_both"])
@@ -575,6 +647,17 @@ def review_summary(out_dir: str) -> dict:
                     referent_unreviewed += 1
                 elif item["feasible_both"] == "yes":
                     referent_yes += 1
+                dup = item["duplicate_target"]
+                if dup == "unreviewed":
+                    referent_dup_unreviewed += 1
+                elif dup == "yes":
+                    referent_dup_yes += 1
+                elif dup == "unclear":
+                    referent_dup_unclear += 1
+                src = item["duplicate_source"] or ""
+                dup_source[src] = dup_source.get(src, 0) + 1
+                if item["feasible_both"] == "yes" and dup == "yes":
+                    primary_eligible += 1
         else:
             non_pairable += 1
     return {
@@ -583,6 +666,11 @@ def review_summary(out_dir: str) -> dict:
         "non_pairable": non_pairable,
         "referent_pairable_unreviewed": referent_unreviewed,
         "referent_pairable_yes": referent_yes,
+        "referent_pairable_dup_unreviewed": referent_dup_unreviewed,
+        "referent_pairable_dup_yes": referent_dup_yes,
+        "referent_pairable_dup_unclear": referent_dup_unclear,
+        "duplicate_source": dup_source,
+        "primary_eligible": primary_eligible,
         "total": len(rows),
     }
 
@@ -591,11 +679,12 @@ def review_queue(
     out_dir: str,
     *,
     status: str | None = "unreviewed",
+    duplicate_status: str | None = None,
     categories: list[str] | None = None,
     only_pairable: bool = True,
     limit: int | None = None,
 ) -> list[dict]:
-    """Return an ordered list of scenes for manual feasibility review.
+    """Return an ordered list of scenes for manual review.
 
     Priority order:
       1. referent_selection, pairable, matching status
@@ -607,6 +696,10 @@ def review_queue(
         out_dir: directory holding manifest.csv and frames/.
         status: filter on feasible_both; None keeps every status. Must be a
             member of FEASIBLE_VALUES when set.
+        duplicate_status: filter on duplicate_target; None keeps every value.
+            Must be a member of DUPLICATE_VALUES when set. Setting this to
+            `unclear` focuses a session on the scenes the automated proposal
+            pass flagged as borderline, so human effort confirms only those.
         categories: optional allow-list of effective categories; None keeps all.
         only_pairable: when True, drop scenes that do not form a minimal pair.
         limit: optional maximum number of items to return.
@@ -616,11 +709,18 @@ def review_queue(
             f"status must be one of {sorted(FEASIBLE_VALUES)} or None, "
             f"got {status!r}"
         )
+    if duplicate_status is not None and duplicate_status not in DUPLICATE_VALUES:
+        raise ValueError(
+            f"duplicate_status must be one of {sorted(DUPLICATE_VALUES)} or "
+            f"None, got {duplicate_status!r}"
+        )
     cat_allow = set(categories) if categories is not None else None
 
     items = [_review_item(row) for row in load_manifest(out_dir)]
     if status is not None:
         items = [it for it in items if it["feasible_both"] == status]
+    if duplicate_status is not None:
+        items = [it for it in items if it["duplicate_target"] == duplicate_status]
     if cat_allow is not None:
         items = [it for it in items if it["category"] in cat_allow]
     if only_pairable:
