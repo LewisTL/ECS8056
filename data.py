@@ -296,33 +296,46 @@ def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5,
     Imported lazily so the TensorFlow/TFDS stack is only required when streaming,
     keeping this module importable in environments that hold only the model deps.
     """
-    import tensorflow_datasets as tfds
+    # Importing TFDS pulls tensorflow-metadata, whose generated code is compiled
+    # against a specific protobuf major version. Recent TensorFlow and
+    # tensorflow-metadata require protobuf 6, and protobuf refuses to run its
+    # generated code on an older runtime (for example gencode 6.31.1 on runtime
+    # 5.29.6). Translate that failure into an actionable instruction.
+    builder_from_directory = None
+    try:
+        import tensorflow_datasets as tfds
 
-    # `builder_from_directory` is a re-export whose public aliases
-    # (`tfds.builder_from_directory`, `tfds.core.builder_from_directory`) are
-    # absent in some TFDS builds. It is defined in
-    # `tensorflow_datasets.core.read_only_builder`, so fall back to importing it
-    # from there before giving up.
-    builder_from_directory = getattr(tfds, "builder_from_directory", None)
-    if builder_from_directory is None:
-        builder_from_directory = getattr(
-            getattr(tfds, "core", None), "builder_from_directory", None)
-    if builder_from_directory is None:
-        try:
+        # `builder_from_directory` is a re-export whose public aliases
+        # (`tfds.builder_from_directory`, `tfds.core.builder_from_directory`) are
+        # absent in some TFDS builds. It is defined in
+        # `tensorflow_datasets.core.read_only_builder`, so fall back to importing
+        # it from there before giving up.
+        builder_from_directory = getattr(tfds, "builder_from_directory", None)
+        if builder_from_directory is None:
+            builder_from_directory = getattr(
+                getattr(tfds, "core", None), "builder_from_directory", None)
+        if builder_from_directory is None:
             from tensorflow_datasets.core.read_only_builder import (
                 builder_from_directory,
             )
-        except ImportError:
-            builder_from_directory = None
+    except Exception as exc:  # noqa: BLE001 - environment-dependent import chain
+        message = str(exc)
+        if "Protobuf" in message or "runtime_version" in message:
+            raise RuntimeError(
+                "TensorFlow Datasets failed to import because the protobuf "
+                "runtime is older than the tensorflow-metadata generated code "
+                "(for example gencode 6.31.1 with runtime 5.29.6). Recent "
+                "TensorFlow and tensorflow-metadata require protobuf 6, so "
+                "install a matching runtime and restart the session:\n"
+                "    pip install \"protobuf>=6.31.1,<7\"\n"
+                "then restart the runtime before re-running."
+            ) from exc
+        raise
     if builder_from_directory is None:
         raise AttributeError(
             "tensorflow_datasets exposes no builder_from_directory in this "
-            "environment. Do not upgrade tensorflow_datasets on managed "
-            "runtimes such as Colab: newer tensorflow-metadata ships protobuf 6 "
-            "gencode that the pinned protobuf 5 runtime rejects. Instead pin a "
-            "protobuf 5 compatible stack, for example "
-            "`pip install \"tensorflow-datasets==4.9.7\" "
-            "\"tensorflow-metadata==1.16.1\"`, then restart the runtime."
+            "environment. Upgrade the package with `pip install -U "
+            "tensorflow_datasets` and restart the runtime."
         )
 
     builder = builder_from_directory(BRIDGE_GCS)
