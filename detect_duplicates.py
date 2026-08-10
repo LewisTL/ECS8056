@@ -213,7 +213,13 @@ def count_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THR
     with torch.no_grad():
         outputs = model(**inputs)
     target_sizes = torch.tensor([image.size[::-1]], device=device)
-    results = processor.post_process_object_detection(
+    # The combined `Owlv2Processor` gained `post_process_object_detection` only in
+    # later transformers releases; on the pinned build it lives on the wrapped
+    # image processor, so resolve whichever is present.
+    post_process = getattr(processor, "post_process_object_detection", None)
+    if post_process is None:
+        post_process = processor.image_processor.post_process_object_detection
+    results = post_process(
         outputs, target_sizes=target_sizes, threshold=score_thresh
     )[0]
     scores = [float(s) for s in results["scores"].tolist()]
