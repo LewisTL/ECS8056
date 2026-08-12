@@ -78,6 +78,27 @@ _STOP_WORDS = (_DETERMINERS | _ACTION_VERBS | _PREPOSITIONS
 
 _WORD_RE = re.compile(r"[a-z]+")
 
+# Words that close the object phrase in `extract_manipulated_noun`. A superset of
+# `_PREPOSITIONS`, kept separate so widening it cannot alter the stop-word set
+# that `extract_target_noun` depends on. Particles that follow a verb rather than
+# introduce a landmark (`up` in "pick up") are absent, since they are already
+# treated as part of the verb.
+_PHRASE_BOUNDARIES = frozenset({
+    "on", "onto", "in", "into", "from", "inside", "of", "to", "at", "with",
+    "and", "then", "off", "over", "under", "beside", "next", "against",
+    "around", "through", "toward", "towards", "for", "near", "beneath",
+    "behind", "between", "above", "below", "down", "out", "away",
+})
+
+# Words that end an instruction by describing the resulting state rather than
+# naming an object ("flip the pot upright"). Without these the last word of the
+# phrase is an adverb, and in synthesised mode that would be queried as an object
+# and written into the instruction.
+_TRAILING_MODIFIERS = frozenset({
+    "upright", "straight", "flat", "sideways", "upside", "closed", "shut",
+    "open", "together", "apart", "over", "back", "aside", "level", "steady",
+})
+
 # Module-level model cache so the detector is loaded once per process.
 _OWL_CACHE: dict = {}
 
@@ -103,6 +124,53 @@ def extract_target_noun(instruction: str, tags=None) -> str | None:
     noun = _extract_with_regex(text)
     if noun:
         return noun
+    return _extract_with_spacy(text)
+
+
+def extract_manipulated_noun(instruction: str) -> str | None:
+    """Return the head noun of the object being manipulated, or None.
+
+    Distinct from `extract_target_noun`, which returns the noun a spatial term
+    selects. The two differ whenever the instruction contains a landmark: in
+    "put the corn in the pot on the left" the spatial term selects the pot, while
+    the object being manipulated is the corn. Scene construction in synthesised
+    mode needs the manipulated object, because that object is the one the episode
+    demonstrates is graspable and present in the frame.
+
+    The head is taken as the last content word of the first noun phrase, where
+    the phrase ends at the first preposition. Ending at the preposition is what
+    separates the object from any landmark, and taking the last word rather than
+    the first is what skips modifiers: "grab the red block" gives `block`, not
+    `red`.
+
+    A wrong noun here is not merely a wasted frame. In synthesised mode it is
+    written into the instruction as well as queried, so an adverb read as an object
+    would produce a nonsensical trial rather than a rejected one, which is why
+    state-describing words are excluded explicitly.
+    """
+    text = instruction.strip().lower()
+    if not text:
+        return None
+    words = _WORD_RE.findall(text)
+
+    phrase = []
+    for word in words:
+        if (word in _ACTION_VERBS or word in _DETERMINERS
+                or word in _TRAILING_MODIFIERS):
+            continue
+        # A preposition closes the object phrase and opens a landmark phrase.
+        if word in _PHRASE_BOUNDARIES:
+            if phrase:
+                break
+            continue
+        if word in SPATIAL_TOKENS or word in _SPATIAL_PHRASE_WORDS:
+            if phrase:
+                break
+            continue
+        phrase.append(word)
+
+    if phrase:
+        return phrase[-1]
     return _extract_with_spacy(text)
 
 

@@ -47,6 +47,9 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from data import CATEGORY_REFERENT, is_lateral_term, make_pair
+# Only the threshold constant is taken at import time, so the detector's heavy
+# dependencies stay behind the lazy imports inside the functions that call it.
+from detect_duplicates import DEFAULT_SCORE_THRESH
 
 # Sign relating image x to the lateral action component: +1 if a target further
 # right in the image implies a larger dx. Identity until the mirror control
@@ -95,12 +98,51 @@ DEFAULT_FEATHER = 6        # width of the alpha ramp at the patch border
 DEFAULT_MIN_GAP = 1.2
 DEFAULT_MARGIN = 8         # keep pasted content this far inside the frame
 
+# Where the trial's instruction comes from.
+#
+# `inherited` takes the episode's own instruction, which keeps the wording as it
+# appears in the source data but restricts the pool to episodes that already
+# contain a lateral term in a referent-selection frame. That pool is very small.
+#
+# `synthesised` writes the instruction over the episode's manipulated object, so
+# any cached frame with a nameable object qualifies. The pool is then the whole
+# cache rather than a thin slice of it, and the wording is held constant across
+# every trial, which removes instruction form as a nuisance variable: under
+# inherited wording a difference between two scenes could always be attributed to
+# their differing phrasing rather than to their geometry. The cost is external
+# validity, since the instructions are no longer verbatim from the source data.
+# The unmodified Bridge scenes carry that burden instead, which is what they are
+# for, and `instruction_source` records which mode produced each scene.
+MODE_INHERITED = "inherited"
+MODE_SYNTHESISED = "synthesised"
+INSTRUCTION_MODES = (MODE_INHERITED, MODE_SYNTHESISED)
+
+# The synthesised wording. Deliberately the plainest form that names the object
+# and a side: an unusual construction would confound a null result with a failure
+# to parse the instruction at all.
+SYNTHESISED_TEMPLATE = "pick up the {noun} on the left"
+
+# Nouns that may not be written into a synthesised instruction. These name
+# fixtures and surfaces rather than movable objects, so "pick up the microwave on
+# the left" is an unsatisfiable request whatever the arrangement, and a failure to
+# comply would say nothing about spatial grounding. Excluding them is the same
+# requirement that motivated the constructed set in the first place: an
+# instruction the scene cannot support confounds the measurement. The inherited
+# mode needs no such list, because a demonstrated episode instruction is
+# satisfiable by construction.
+IMMOVABLE_NOUNS = frozenset({
+    "sink", "stove", "oven", "microwave", "fridge", "refrigerator", "freezer",
+    "dishwasher", "drawer", "cabinet", "cupboard", "counter", "countertop",
+    "table", "tabletop", "shelf", "wall", "floor", "door", "burner", "faucet",
+    "tap", "hob", "worktop", "surface", "top", "side", "area", "space",
+})
+
 MANIFEST_NAME = "constructed_manifest.csv"
 FRAMES_DIR = "frames"
 
 CONSTRUCTED_FIELDS = [
     "construct_id", "base_scene_id", "noun", "spatial_term", "configuration",
-    "instr_a", "instr_b",
+    "instr_a", "instr_b", "instruction_source",
     "image_path", "image_width", "image_height",
     "x_source", "x_pasted", "y_source",
     "x_gripper", "gripper_source", "gripper_score",
@@ -426,6 +468,7 @@ class ConstructedScene:
     configuration: str
     instr_a: str
     instr_b: str
+    instruction_source: str
     image_path: str
     image_width: int
     image_height: int
@@ -470,6 +513,7 @@ def build_scene(
     margin: int = DEFAULT_MARGIN,
     seed: int = 0,
     mask=None,
+    instruction_source: str = MODE_INHERITED,
 ):
     """Construct one two-instance trial from a single-instance base frame.
 
@@ -515,6 +559,7 @@ def build_scene(
         configuration=configuration,
         instr_a=instruction,
         instr_b=swapped,
+        instruction_source=instruction_source,
         image_path=os.path.join(FRAMES_DIR, f"{construct_id}.png"),
         image_width=image.width,
         image_height=image.height,
@@ -580,42 +625,106 @@ SINGLE_SECOND_MAX = 0.15
 # `select_base_scenes` for why placement instructions cannot.
 DEFAULT_CATEGORIES = (CATEGORY_REFERENT,)
 
+# Detection floor used by the diagnostic. Low enough that a frame returning
+# nothing at all is informative about the query rather than about the threshold.
+DIAGNOSTIC_FLOOR = 0.02
 
-def select_base_scenes(manifest_rows, *, categories=DEFAULT_CATEGORIES, limit=None):
+# Outcomes of the base-frame gate, in the order they are tested.
+GATE_OK = "ok"
+GATE_NO_INSTANCE = "no_instance"
+GATE_WEAK = "weak_instance"
+GATE_MULTI = "multi_instance"
+
+
+def gate_base_frame(instances, *, single_high: float = SINGLE_HIGH,
+                    single_second_max: float = SINGLE_SECOND_MAX) -> str:
+    """Whether a frame's detections permit a construction, and why not if they do not.
+
+    A construction needs exactly one instance whose box can be trusted: the box
+    fixes what is cut, and a second instance would mean the frame is already a
+    two-instance trial with a geometry that was not chosen.
+
+    Pure so the thresholds can be reasoned about without a detector, and shared
+    with the diagnostic so that what is reported and what is built cannot drift
+    apart. The absolute score scale is a property of the detector rather than of
+    this data, so the thresholds are arguments and are calibrated against the
+    observed distribution rather than assumed.
+    """
+    if not instances:
+        return GATE_NO_INSTANCE
+    scores = sorted((float(getattr(i, "score", i)) for i in instances), reverse=True)
+    if scores[0] < single_high:
+        return GATE_WEAK
+    if len(scores) > 1 and scores[1] >= single_second_max:
+        return GATE_MULTI
+    return GATE_OK
+
+
+def select_base_scenes(manifest_rows, *, categories=DEFAULT_CATEGORIES, limit=None,
+                       instruction_mode: str = MODE_INHERITED,
+                       template: str = SYNTHESISED_TEMPLATE):
     """Bridge scenes eligible to seed a construction.
 
-    Requires a minimal pair on a lateral term, since the construction places
-    instances left and right, and a cached frame to cut from. Feasibility and
-    duplicate-target labels are deliberately not consulted: the construction
-    supplies the property those labels were filtering for, so requiring them
-    would reimpose the scarcity the constructed set exists to escape.
+    Every returned row carries the instruction the trial will use, the noun to
+    detect, and `instruction_source`, so the caller neither re-derives them nor
+    has to know which mode produced them.
 
-    The category filter defaults to `referent_selection` and is not optional in
-    practice. In a placement instruction the spatial term governs the landmark
-    rather than the object being moved ("move the pot to the right of the
-    spoon"), so duplicating the moved object produces two pots while the swapped
-    term still describes a destination beside the spoon: the term does not select
-    between the two instances and the trial measures nothing. Duplicating the
-    landmark instead does not help either, because the first action is the reach
-    toward the pot and is identical for both variants, which is the same reason
-    placement scenes are excluded from the analysis. Passing `categories=None`
-    disables the filter and is supported only for inspecting the wider pool.
+    In `inherited` mode the instruction is the episode's own, which must yield a
+    minimal pair on a lateral term since the construction places instances left
+    and right. The category filter then defaults to `referent_selection` and is
+    not optional in practice: in a placement instruction the spatial term governs
+    the landmark rather than the object being moved ("move the pot to the right of
+    the spoon"), so duplicating the moved object produces two pots while the
+    swapped term still describes a destination beside the spoon, and the term does
+    not select between the two instances. Passing `categories=None` disables the
+    filter and is supported only for inspecting the wider pool.
+
+    In `synthesised` mode the instruction is written from `template` over the
+    episode's manipulated object, so any cached frame qualifies and neither a
+    pre-existing spatial term nor a category is required. See
+    `SYNTHESISED_TEMPLATE` for why this is the stronger stimulus as well as the
+    larger pool, and `IMMOVABLE_NOUNS` for the one restriction it does impose:
+    the written instruction has to be satisfiable, since an unliftable target
+    would reintroduce the confound the constructed set exists to remove.
+
+    Feasibility and duplicate-target labels are deliberately not consulted in
+    either mode: the construction supplies the property those labels were
+    filtering for, so requiring them would reimpose the scarcity the constructed
+    set exists to escape.
     """
+    from detect_duplicates import extract_manipulated_noun, extract_target_noun
+
+    if instruction_mode not in INSTRUCTION_MODES:
+        raise ValueError(f"unknown instruction_mode: {instruction_mode!r}")
+
     selected = []
     for row in manifest_rows:
-        made = make_pair(row.get("instruction", ""))
-        if made is None:
-            continue
-        term, _ = made
-        if not is_lateral_term(term):
-            continue
         if not row.get("image_path"):
             continue
-        if categories is not None:
-            category = row.get("category_manual") or row.get("category", "")
-            if category not in categories:
+
+        if instruction_mode == MODE_SYNTHESISED:
+            noun = extract_manipulated_noun(row.get("instruction", ""))
+            if not noun or noun in IMMOVABLE_NOUNS:
                 continue
-        selected.append(row)
+            instruction = template.format(noun=noun)
+        else:
+            made = make_pair(row.get("instruction", ""))
+            if made is None:
+                continue
+            term, _ = made
+            if not is_lateral_term(term):
+                continue
+            if categories is not None:
+                category = row.get("category_manual") or row.get("category", "")
+                if category not in categories:
+                    continue
+            instruction = row["instruction"]
+            noun = extract_target_noun(instruction)
+            if not noun:
+                continue
+
+        selected.append({**row, "instruction": instruction, "target_noun": noun,
+                         "instruction_source": instruction_mode})
         if limit is not None and len(selected) >= limit:
             break
     return selected
@@ -635,6 +744,10 @@ def run_construction(
     margin: int = DEFAULT_MARGIN,
     detect_gripper: bool = True,
     segment: bool = True,
+    score_thresh: float = DEFAULT_SCORE_THRESH,
+    single_high: float = SINGLE_HIGH,
+    single_second_max: float = SINGLE_SECOND_MAX,
+    instruction_mode: str = MODE_INHERITED,
     seed: int = 0,
     verbose: bool = True,
 ) -> dict:
@@ -645,42 +758,38 @@ def run_construction(
     seed one trial per achievable configuration. Writes the frames and the
     manifest under `out_dir` and returns a summary of what was built and why
     scenes were rejected, so the yield is inspectable rather than silent.
+
+    The detection thresholds are arguments rather than fixed constants because
+    their scale belongs to the detector, not to this data. `diagnose_detection`
+    reports the distribution they should be set against.
     """
     from data import load_manifest
-    from detect_duplicates import (detect_instances, extract_target_noun,
-                                   segment_instance)
+    from detect_duplicates import detect_instances, segment_instance
 
     rows = manifest_rows if manifest_rows is not None else load_manifest(cache_dir)
-    candidates = select_base_scenes(rows, categories=categories, limit=limit)
+    candidates = select_base_scenes(rows, categories=categories, limit=limit,
+                                    instruction_mode=instruction_mode)
 
     scenes: list[ConstructedScene] = []
-    rejects = {"no_noun": 0, "no_instance": 0, "multi_instance": 0,
-               "weak_instance": 0, "no_placement": 0, "missing_frame": 0}
+    rejects = {GATE_NO_INSTANCE: 0, GATE_WEAK: 0, GATE_MULTI: 0,
+               "no_placement": 0, "missing_frame": 0}
 
     os.makedirs(os.path.join(out_dir, FRAMES_DIR), exist_ok=True)
 
     for row in candidates:
         instruction = row["instruction"]
-        noun = extract_target_noun(instruction)
-        if not noun:
-            rejects["no_noun"] += 1
-            continue
+        noun = row["target_noun"]
         frame_path = os.path.join(cache_dir, row["image_path"])
         if not os.path.isfile(frame_path):
             rejects["missing_frame"] += 1
             continue
         base_image = Image.open(frame_path).convert("RGB")
 
-        found = detect_instances(base_image, noun)
-        if not found:
-            rejects["no_instance"] += 1
-            continue
-        if found[0].score < SINGLE_HIGH:
-            rejects["weak_instance"] += 1
-            continue
-        if len(found) > 1 and found[1].score >= SINGLE_SECOND_MAX:
-            # Already holds two plausible instances, so nothing to construct.
-            rejects["multi_instance"] += 1
+        found = detect_instances(base_image, noun, score_thresh=score_thresh)
+        verdict = gate_base_frame(found, single_high=single_high,
+                                  single_second_max=single_second_max)
+        if verdict != GATE_OK:
+            rejects[verdict] += 1
             continue
 
         if detect_gripper:
@@ -701,6 +810,7 @@ def run_construction(
                 x_gripper=x_gripper, gripper_source=gripper_source,
                 gripper_score=gripper_score, padding=padding, feather=feather,
                 min_gap=min_gap, margin=margin, seed=seed, mask=mask,
+                instruction_source=row["instruction_source"],
             )
             if result is None:
                 continue
@@ -734,6 +844,95 @@ def run_construction(
             print(f"[run_construction] {by_cutout[CUTOUT_BOX]} scenes fell back to "
                   "a box cutout; those duplicates carry background as well as the "
                   "object and read as pasted rectangles")
+    return summary
+
+
+# --------------------------------------------------------------------------- #
+# Detection diagnostic
+# --------------------------------------------------------------------------- #
+def diagnose_detection(
+    cache_dir: str,
+    candidates,
+    *,
+    limit: int | None = None,
+    score_thresh: float = DIAGNOSTIC_FLOOR,
+    single_high: float = SINGLE_HIGH,
+    single_second_max: float = SINGLE_SECOND_MAX,
+    top_k: int = 3,
+):
+    """Per-frame record of what the detector returned and how the gate ruled.
+
+    A zero yield has two very different causes that the rejection counts alone
+    cannot separate: the queried noun may not name anything in the frame, or the
+    detector may be finding the object and scoring it below a threshold that was
+    set without reference to this data. The first is a extraction fault and the
+    second is a calibration fault, and they call for opposite responses.
+
+    Detection is therefore run at `DIAGNOSTIC_FLOOR`, well below the working
+    threshold, and the scores are returned unfiltered. A frame whose best score
+    sits just under `single_high` is evidence the threshold is too strict; a frame
+    with nothing at all above the floor is evidence the query is wrong.
+
+    Returns one dict per frame, with the top boxes retained so the notebook can
+    draw them and confirm the detection is on the object rather than merely
+    confident.
+    """
+    from detect_duplicates import detect_instances
+
+    rows = list(candidates)[:limit] if limit is not None else list(candidates)
+    out = []
+    for row in rows:
+        frame_path = os.path.join(cache_dir, row["image_path"])
+        record = {
+            "base_scene_id": str(row.get("episode_index", "")),
+            "instruction": row.get("instruction", ""),
+            "noun": row.get("target_noun", ""),
+            "image_path": row["image_path"],
+            "scores": [],
+            "boxes": [],
+            "verdict": "missing_frame",
+        }
+        if os.path.isfile(frame_path):
+            image = Image.open(frame_path).convert("RGB")
+            found = detect_instances(image, record["noun"], score_thresh=score_thresh)
+            record["scores"] = [round(float(i.score), 4) for i in found[:top_k]]
+            record["boxes"] = [i.box for i in found[:top_k]]
+            record["verdict"] = gate_base_frame(
+                found, single_high=single_high, single_second_max=single_second_max)
+        out.append(record)
+    return out
+
+
+def summarise_diagnosis(records, *, single_high: float = SINGLE_HIGH) -> dict:
+    """Aggregate `diagnose_detection` into the numbers that pick a threshold.
+
+    `recoverable` counts frames the gate rejected as weak but where the detector
+    did return a box: these are the frames a lower `single_high` would admit, and
+    their score quantiles say where to put it.
+    """
+    verdicts: dict = {}
+    best = []
+    recoverable = 0
+    for record in records:
+        verdicts[record["verdict"]] = verdicts.get(record["verdict"], 0) + 1
+        if record["scores"]:
+            best.append(record["scores"][0])
+            if record["verdict"] == GATE_WEAK:
+                recoverable += 1
+    summary = {
+        "frames": len(records),
+        "by_verdict": verdicts,
+        "with_any_detection": len(best),
+        "recoverable_by_lowering_single_high": recoverable,
+        "best_score_quantiles": {},
+    }
+    if best:
+        quantiles = np.quantile(best, [0.1, 0.25, 0.5, 0.75, 0.9])
+        summary["best_score_quantiles"] = {
+            label: round(float(value), 4) for label, value
+            in zip(("p10", "p25", "p50", "p75", "p90"), quantiles)
+        }
+        summary["best_score_max"] = round(float(np.max(best)), 4)
     return summary
 
 
