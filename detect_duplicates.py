@@ -399,20 +399,12 @@ def detect_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_TH
     return instances
 
 
-def segment_instance(image, box):
-    """Mask of the object inside `box`, or None when segmentation is unavailable.
+def _sam_mask(image, *, box=None, point=None):
+    """Run the segmentation model on one prompt, returning a boolean HxW mask.
 
-    Returns a boolean HxW array covering the whole frame, true on the object.
-
-    A bounding box is a poor cutout for compositing: the rectangle carries the
-    table, shadows, and any neighbouring object that happens to fall inside it,
-    so the pasted copy reads as a pasted rectangle rather than as a second
-    object. Prompting SAM with the detected box gives the instance outline, and
-    compositing along that outline leaves only the object itself.
-
-    The box prompt is what makes this reliable without supervision: the region
-    to segment is already known from detection, so the model is only asked to
-    find the boundary within it rather than to decide what is salient.
+    Returns None when the model is unavailable or the mask comes back empty. An
+    empty mask is a failure rather than a valid empty region, so it is reported
+    the same way and the caller decides how to degrade.
     """
     import numpy as np
     import torch
@@ -427,8 +419,13 @@ def segment_instance(image, box):
         return None
     processor, model, device = loaded
 
-    prompt = [[[float(v) for v in clip_box(box, *image.size)]]]
-    inputs = processor(image, input_boxes=prompt, return_tensors="pt").to(device)
+    prompt = {}
+    if box is not None:
+        prompt["input_boxes"] = [[[float(v) for v in clip_box(box, *image.size)]]]
+    if point is not None:
+        prompt["input_points"] = [[[float(point[0]), float(point[1])]]]
+
+    inputs = processor(image, return_tensors="pt", **prompt).to(device)
     with torch.no_grad():
         outputs = model(**inputs, multimask_output=False)
     masks = processor.image_processor.post_process_masks(
@@ -437,9 +434,40 @@ def segment_instance(image, box):
         inputs["reshaped_input_sizes"].cpu(),
     )
     mask = np.asarray(masks[0][0][0], dtype=bool)
-    # An empty mask is a failure, not a valid empty object, so it is reported as
-    # unavailable and the caller falls back to the box.
     return mask if mask.any() else None
+
+
+def segment_instance(image, box):
+    """Mask of the object inside `box`, or None when segmentation is unavailable.
+
+    Returns a boolean HxW array covering the whole frame, true on the object.
+
+    A bounding box is a poor cutout for compositing: the rectangle carries the
+    table, shadows, and any neighbouring object that happens to fall inside it,
+    so the pasted copy reads as a pasted rectangle rather than as a second
+    object. Prompting with the detected box gives the instance outline, and
+    compositing along that outline leaves only the object itself.
+
+    The box prompt is what makes this reliable without supervision: the region
+    to segment is already known from detection, so the model is only asked to
+    find the boundary within it rather than to decide what is salient.
+    """
+    return _sam_mask(image, box=box)
+
+
+def segment_surface(image, point):
+    """Mask of the surface at `point`, or None when segmentation is unavailable.
+
+    Used to find the extent of the table an object rests on. The prompt is a
+    point rather than a box because the surface has no detected box: an
+    open-vocabulary query for a table returns a rectangle spanning most of the
+    frame, which constrains nothing, whereas a point known to lie on the surface
+    identifies it directly.
+
+    The natural prompt is a point just below the object's own footprint, which is
+    on the supporting surface whenever the object is resting on it.
+    """
+    return _sam_mask(image, point=point)
 
 
 def count_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THRESH):

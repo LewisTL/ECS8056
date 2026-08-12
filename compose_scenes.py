@@ -145,6 +145,7 @@ CONSTRUCTED_FIELDS = [
     "instr_a", "instr_b", "instruction_source",
     "image_path", "image_width", "image_height",
     "x_source", "x_pasted", "y_source",
+    "y_base_source", "y_base_pasted", "y_shift_px", "surface_source",
     "x_gripper", "gripper_source", "gripper_score",
     "x_target_a", "x_target_b", "expected_sign_image",
     "offset_a_px", "offset_b_px", "separation_px",
@@ -300,6 +301,103 @@ def plan_placement(
 # --------------------------------------------------------------------------- #
 # Compositing
 # --------------------------------------------------------------------------- #
+# --------------------------------------------------------------------------- #
+# Support surface geometry
+# --------------------------------------------------------------------------- #
+# The camera views the table obliquely, so the surface is not a horizontal band
+# in the image: its image row varies with the column. Holding the duplicate's
+# image y at the source's therefore walks it off the table, which is visible as
+# an object floating above the surface or standing in front of its near edge.
+#
+# The rule used instead is constant relative depth. The surface occupies a run of
+# rows in each column, and the object's base is placed at the same fractional
+# position within that run as the source's base occupied in its own column. This
+# needs no camera calibration, follows a surface of any shape, and has a useful
+# side effect: a point at constant relative depth is at roughly constant distance
+# from the camera, so the apparent size of the object is unchanged and the patch
+# does not need rescaling.
+
+SURFACE_SOURCE_DETECTED = "detected"
+SURFACE_SOURCE_NONE = "none"
+
+
+SURFACE_PROBE_DROP = 6      # pixels below the object's base to prompt from
+
+
+def locate_surface(image, box, *, probe_drop: int = SURFACE_PROBE_DROP):
+    """Mask of the surface the boxed object rests on, or None.
+
+    The prompt is a point just below the centre of the object's base. That point
+    is on the supporting surface whenever the object is resting on it, which is
+    the case for every object in these frames, so no separate detection of the
+    table is needed and no query has to name it. A named query would be worse:
+    "table" returns a box spanning most of the frame, which localises nothing.
+
+    The drop below the base is small so the probe stays on the same surface
+    rather than reaching past a near edge onto the floor behind or in front.
+    """
+    from detect_duplicates import segment_surface
+
+    x0, _, x1, y1 = (float(v) for v in box)
+    x_probe = 0.5 * (x0 + x1)
+    height = image.height if isinstance(image, Image.Image) else image.shape[0]
+    y_probe = min(y1 + probe_drop, height - 1)
+    return segment_surface(image, (x_probe, y_probe))
+
+
+def surface_span(mask, x: int):
+    """The run of rows the surface occupies in column `x`, or None.
+
+    Returns (y_top, y_bottom) inclusive. The longest contiguous run is taken
+    rather than the full extent of the column, because a segmentation may include
+    specks elsewhere in the column and the extent would then span the gap between
+    them and report rows that are not surface at all.
+    """
+    array = np.asarray(mask, dtype=bool)
+    if not 0 <= int(x) < array.shape[1]:
+        return None
+    column = array[:, int(x)]
+    rows = np.flatnonzero(column)
+    if rows.size == 0:
+        return None
+
+    # Split the true rows into contiguous runs and keep the longest.
+    breaks = np.flatnonzero(np.diff(rows) > 1)
+    starts = np.concatenate(([0], breaks + 1))
+    ends = np.concatenate((breaks, [rows.size - 1]))
+    lengths = ends - starts
+    longest = int(np.argmax(lengths))
+    return int(rows[starts[longest]]), int(rows[ends[longest]])
+
+
+def plan_vertical(mask, x_source: float, y_base: float, x_target: float):
+    """Row the duplicate's base must occupy at `x_target` to stay on the surface.
+
+    Returns the target base row, or None when the surface is absent from either
+    column or the result would not land on it. Returning None is what keeps a
+    misplaced duplicate out of the set: the configuration is then skipped rather
+    than composited off the table.
+    """
+    source = surface_span(mask, round(x_source))
+    target = surface_span(mask, round(x_target))
+    if source is None or target is None:
+        return None
+
+    top_source, bottom_source = source
+    depth = bottom_source - top_source
+    # A degenerate source run carries no depth information, so the fraction is
+    # taken as the midpoint rather than dividing by zero.
+    fraction = 0.5 if depth <= 0 else (float(y_base) - top_source) / depth
+    fraction = min(max(fraction, 0.0), 1.0)
+
+    top_target, bottom_target = target
+    y_target = top_target + fraction * (bottom_target - top_target)
+    y_target = int(round(y_target))
+    if not (top_target <= y_target <= bottom_target):
+        return None
+    return y_target
+
+
 def _rectangle_alpha(size, feather: int) -> Image.Image:
     """Alpha that fades to zero at the patch border.
 
@@ -380,13 +478,18 @@ def paste_duplicate(
     feather: int = DEFAULT_FEATHER,
     mirror: bool = True,
     mask=None,
+    dy: float = 0.0,
 ):
-    """Composite a copy of the instance at `x_target`.
+    """Composite a copy of the instance at `x_target`, shifted down by `dy`.
 
     The copy is horizontally mirrored by default, so the duplicate reads as a
     second object of the same kind rather than as a repeated cutout, and its
-    shading remains consistent with a scene lit from one side. Vertical position
-    is held at the source's, keeping the duplicate on the same table plane.
+    shading remains consistent with a scene lit from one side.
+
+    `dy` moves the copy vertically, which an oblique camera requires: the table's
+    image row varies with the column, so a copy pasted at the source's own row
+    would leave the surface. `plan_vertical` computes the shift; zero reproduces
+    the fronto-parallel case.
 
     When `mask` is given the copy is cut along the object's outline, so only the
     object is transferred. Without it the whole box is transferred, including
@@ -409,7 +512,7 @@ def paste_duplicate(
 
     width, height = patch.size
     left = int(round(x_target - width / 2.0))
-    top = crop[1]
+    top = crop[1] + int(round(dy))
     left = max(0, min(left, image.width - width))
     top = max(0, min(top, image.height - height))
 
@@ -475,6 +578,10 @@ class ConstructedScene:
     x_source: float
     x_pasted: float
     y_source: float
+    y_base_source: float
+    y_base_pasted: float
+    y_shift_px: float
+    surface_source: str
     x_gripper: float
     gripper_source: str
     gripper_score: float
@@ -513,16 +620,20 @@ def build_scene(
     margin: int = DEFAULT_MARGIN,
     seed: int = 0,
     mask=None,
+    surface=None,
     instruction_source: str = MODE_INHERITED,
 ):
     """Construct one two-instance trial from a single-instance base frame.
 
     Returns (image, ConstructedScene) or None when the configuration cannot be
     realised in this frame, for example because the duplicate would leave the
-    image or land on the wrong side of the start position.
+    image, land on the wrong side of the start position, or come to rest off the
+    supporting surface.
 
     `mask` is the source instance's silhouette, used to cut the duplicate along
-    the object's outline instead of its bounding box.
+    the object's outline instead of its bounding box. `surface` is the mask of the
+    surface the object rests on, used to place the duplicate at the row the
+    perspective requires rather than at the source's own row.
     """
     made = make_pair(instruction)
     if made is None:
@@ -546,9 +657,20 @@ def build_scene(
     if placement is None:
         return None
 
+    # The base of the object, which is what has to rest on the surface.
+    y_base = y1
+    if surface is None:
+        dy, y_pasted, surface_source = 0.0, y_base, SURFACE_SOURCE_NONE
+    else:
+        planned = plan_vertical(surface, x_source, y_base, placement.x_pasted)
+        if planned is None:
+            return None
+        dy, y_pasted, surface_source = (planned - y_base, float(planned),
+                                        SURFACE_SOURCE_DETECTED)
+
     image, paste_box, cutout_mode = paste_duplicate(
         base_image, source_box, placement.x_pasted, padding=padding,
-        feather=feather, mask=mask,
+        feather=feather, mask=mask, dy=dy,
     )
     construct_id = f"c{int(base_scene_id):06d}_{configuration}_{term}"
     scene = ConstructedScene(
@@ -566,6 +688,10 @@ def build_scene(
         x_source=placement.x_source,
         x_pasted=placement.x_pasted,
         y_source=y_source,
+        y_base_source=y_base,
+        y_base_pasted=y_pasted,
+        y_shift_px=float(dy),
+        surface_source=surface_source,
         x_gripper=placement.x_gripper,
         gripper_source=gripper_source,
         gripper_score=gripper_score,
@@ -744,6 +870,7 @@ def run_construction(
     margin: int = DEFAULT_MARGIN,
     detect_gripper: bool = True,
     segment: bool = True,
+    require_surface: bool = True,
     score_thresh: float = DEFAULT_SCORE_THRESH,
     single_high: float = SINGLE_HIGH,
     single_second_max: float = SINGLE_SECOND_MAX,
@@ -766,13 +893,18 @@ def run_construction(
     from data import load_manifest
     from detect_duplicates import detect_instances, segment_instance
 
+    if require_surface and not segment:
+        raise ValueError(
+            "require_surface needs segment=True: the supporting surface is found "
+            "by segmentation, so without it every frame would be rejected")
+
     rows = manifest_rows if manifest_rows is not None else load_manifest(cache_dir)
     candidates = select_base_scenes(rows, categories=categories, limit=limit,
                                     instruction_mode=instruction_mode)
 
     scenes: list[ConstructedScene] = []
     rejects = {GATE_NO_INSTANCE: 0, GATE_WEAK: 0, GATE_MULTI: 0,
-               "no_placement": 0, "missing_frame": 0}
+               "no_surface": 0, "no_placement": 0, "missing_frame": 0}
 
     os.makedirs(os.path.join(out_dir, FRAMES_DIR), exist_ok=True)
 
@@ -798,9 +930,13 @@ def run_construction(
             x_gripper, gripper_source, gripper_score = (
                 base_image.width / 2.0, GRIPPER_SOURCE_FALLBACK, 0.0)
 
-        # Segment once per base frame: the mask depends on the source instance,
-        # not on where the duplicate is placed, so all configurations share it.
+        # Segment once per base frame: neither mask depends on where the
+        # duplicate is placed, so all configurations share them.
         mask = segment_instance(base_image, found[0].box) if segment else None
+        surface = locate_surface(base_image, found[0].box) if segment else None
+        if surface is None and require_surface:
+            rejects["no_surface"] += 1
+            continue
 
         built_any = False
         for configuration in configurations:
@@ -810,7 +946,7 @@ def run_construction(
                 x_gripper=x_gripper, gripper_source=gripper_source,
                 gripper_score=gripper_score, padding=padding, feather=feather,
                 min_gap=min_gap, margin=margin, seed=seed, mask=mask,
-                instruction_source=row["instruction_source"],
+                surface=surface, instruction_source=row["instruction_source"],
             )
             if result is None:
                 continue
