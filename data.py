@@ -367,6 +367,78 @@ for _a, _b in ANTONYM_PAIRS:
     SWAP.setdefault(_a, _b)
     SWAP.setdefault(_b, _a)
 
+# Spatial axis each antonym pair contrasts, and the index of the translation
+# component in the action 7-vector [dx, dy, dz, ...] on which a correct response
+# to the swap should appear.
+#
+# The probe previously read dx for every pair, which is only right for the
+# lateral terms: a front/back or top/bottom swap has no reason to change the
+# lateral component, so pooling them onto dx adds noise to the measurement. The
+# axis is also what decides which terms admit a mirror control, since a
+# horizontal flip of the image reverses the lateral axis and leaves the other
+# two unchanged.
+AXIS_LATERAL = "lateral"     # dx, reversed by a horizontal image flip
+AXIS_DEPTH = "depth"         # dy, unchanged by a horizontal image flip
+AXIS_VERTICAL = "vertical"   # dz, unchanged by a horizontal image flip
+# Terms whose contrasted axis depends on the scene rather than on the term.
+# "closer to the plate" points wherever the plate happens to be, so no fixed
+# component can be assigned in advance. These are excluded from axis-specific
+# analysis rather than assigned a plausible-looking default.
+AXIS_SCENE_DEPENDENT = "scene_dependent"
+
+AXIS_INDEX = {AXIS_LATERAL: 0, AXIS_DEPTH: 1, AXIS_VERTICAL: 2}
+
+TERM_AXIS: dict[str, str] = {
+    "left": AXIS_LATERAL,
+    "right": AXIS_LATERAL,
+    "leftmost": AXIS_LATERAL,
+    "rightmost": AXIS_LATERAL,
+    # Depth relations. The camera looks across the workspace, so front/back and
+    # the bare distance superlatives contrast the axis running away from the
+    # robot base.
+    "in front of": AXIS_DEPTH,
+    "behind": AXIS_DEPTH,
+    "front": AXIS_DEPTH,
+    "back": AXIS_DEPTH,
+    "nearest": AXIS_DEPTH,
+    "farthest": AXIS_DEPTH,
+    "top": AXIS_VERTICAL,
+    "bottom": AXIS_VERTICAL,
+    # Distance to a named landmark: direction is set by where the landmark sits.
+    "closer to": AXIS_SCENE_DEPENDENT,
+    "nearer to": AXIS_SCENE_DEPENDENT,
+    "farther from": AXIS_SCENE_DEPENDENT,
+}
+
+# Every swappable term must carry an axis, or a pair could reach the analysis
+# with no defined expectation. Guards against a term being added to
+# ANTONYM_PAIRS without a matching entry here.
+_missing_axis = sorted(set(SWAP) - set(TERM_AXIS))
+if _missing_axis:
+    raise RuntimeError(
+        f"ANTONYM_PAIRS terms without a TERM_AXIS entry: {_missing_axis}"
+    )
+
+
+def term_axis(term: str) -> str | None:
+    """Spatial axis a swappable term contrasts, or None if the term is unknown."""
+    return TERM_AXIS.get(term.lower().strip())
+
+
+def term_axis_index(term: str) -> int | None:
+    """Translation component index a term's swap should act on.
+
+    Returns None for unknown terms and for scene-dependent relations, which have
+    no axis that can be fixed ahead of seeing the scene.
+    """
+    axis = term_axis(term)
+    return AXIS_INDEX.get(axis) if axis is not None else None
+
+
+def is_lateral_term(term: str) -> bool:
+    """Whether a term contrasts the lateral axis, the axis a mirror flip reverses."""
+    return term_axis(term) == AXIS_LATERAL
+
 _SWAP_KEYS = sorted(SWAP, key=len, reverse=True)
 _SWAP_RE = re.compile(
     r"\b(" + "|".join(re.escape(k) for k in _SWAP_KEYS) + r")\b",

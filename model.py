@@ -17,6 +17,10 @@ Design choices:
     fall back.
   * Seeds are fixed centrally and run conditions are logged per prediction for
     reproducibility.
+  * Two readouts are available. `predict_action` returns the argmax action the
+    model would execute. `predict_action_dist` additionally returns a continuous
+    expected-bin value, which resolves directional differences smaller than one
+    action bin (see the continuous readout section below).
 """
 
 from __future__ import annotations
@@ -32,6 +36,14 @@ import numpy as np
 import torch
 from PIL import Image
 from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+
+from action_bins import (
+    EMPTY_TOKEN_ID,
+    ActionReadout,
+    action_token_ids,
+    bin_widths,
+    readout_from_logits,
+)
 
 MODEL_ID = "openvla/openvla-7b"
 DEFAULT_UNNORM_KEY = "bridge_orig"  # action de-normalisation stats for BridgeData V2
@@ -193,6 +205,151 @@ def predict_action(
 
 
 # --------------------------------------------------------------------------- #
+# Continuous action readout
+# --------------------------------------------------------------------------- #
+# The decoding arithmetic lives in action_bins.py, which is free of torch so it
+# can be tested without a GPU. This section holds only the inference path that
+# produces the logits, and the gate that confirms the reimplemented decoding
+# reproduces the executable action.
+
+
+def describe_action_space(vla, unnorm_key: str = DEFAULT_UNNORM_KEY) -> dict:
+    """Report the decoding constants the continuous readout depends on.
+
+    These live in OpenVLA's remote modelling code and can move between
+    revisions, so they are read from the loaded model rather than assumed.
+    """
+    stats = vla.get_action_stats(unnorm_key)
+    n_bins = int(np.asarray(vla.bin_centers).shape[0])
+    ids = action_token_ids(int(vla.vocab_size), n_bins)
+    return {
+        "unnorm_key": unnorm_key,
+        "action_dim": int(vla.get_action_dim(unnorm_key)),
+        "n_bins": n_bins,
+        "vocab_size": int(vla.vocab_size),
+        "bin_center_first": float(np.asarray(vla.bin_centers)[0]),
+        "bin_center_last": float(np.asarray(vla.bin_centers)[-1]),
+        "action_token_id_min": int(ids.min()),
+        "action_token_id_max": int(ids.max()),
+        "q01": list(np.asarray(stats["q01"], dtype=float)),
+        "q99": list(np.asarray(stats["q99"], dtype=float)),
+        "mask": list(np.asarray(stats.get("mask", np.ones(len(stats["q01"]), dtype=bool)))),
+        # Width of one bin in dataset units, the resolution floor of the argmax
+        # readout on each dimension.
+        "bin_width": list(bin_widths(stats, n_bins)),
+    }
+
+
+@torch.inference_mode()
+def predict_action_dist(
+    processor,
+    vla,
+    image: Image.Image,
+    instruction: str,
+    compute_dtype: torch.dtype = torch.bfloat16,
+    unnorm_key: str = DEFAULT_UNNORM_KEY,
+) -> ActionReadout:
+    """Return the argmax action and the continuous expected-bin action.
+
+    Decoding is greedy, matching `predict_action`, and the returned `action`
+    field reproduces it exactly; `verify_readout` asserts that equality on real
+    inputs. The expected value is taken over the model's distribution at each
+    emission step, restricted to the action-token slice and renormalised.
+
+    The scores captured from `generate` are post-processing logits. Greedy
+    decoding applies no warpers, so they equal the raw logits unless a logits
+    processor is configured; `action_mass` surfaces the case where processing
+    has moved weight off the action vocabulary.
+    """
+    prompt = PROMPT_TEMPLATE.format(instruction=instruction)
+    inputs = processor(prompt, image.convert("RGB")).to("cuda:0", dtype=compute_dtype)
+    # The processor's attention_mask is one short of the extended input_ids
+    # below, which would misalign the causal mask. Batch is 1 and unpadded, so
+    # dropping it lets generate rebuild a correctly sized mask.
+    inputs.pop("attention_mask", None)
+    input_ids = inputs.pop("input_ids")
+    if not torch.all(input_ids[:, -1] == EMPTY_TOKEN_ID):
+        pad = torch.tensor([[EMPTY_TOKEN_ID]], dtype=input_ids.dtype,
+                           device=input_ids.device)
+        input_ids = torch.cat((input_ids, pad), dim=1)
+
+    action_dim = vla.get_action_dim(unnorm_key)
+    generated = vla.generate(
+        input_ids,
+        max_new_tokens=action_dim,
+        do_sample=False,
+        output_scores=True,
+        return_dict_in_generate=True,
+        **inputs,
+    )
+
+    return readout_from_logits(
+        token_ids=generated.sequences[0, -action_dim:].cpu().numpy(),
+        logits=torch.stack(generated.scores, dim=0)[:, 0, :].float().cpu().numpy(),
+        bin_centers=vla.bin_centers,
+        vocab_size=int(vla.vocab_size),
+        action_norm_stats=vla.get_action_stats(unnorm_key),
+    )
+
+
+def verify_readout(
+    processor,
+    vla,
+    samples,
+    compute_dtype: torch.dtype = torch.bfloat16,
+    unnorm_key: str = DEFAULT_UNNORM_KEY,
+    verbose: bool = True,
+) -> dict:
+    """Check that the continuous path reproduces the argmax action exactly.
+
+    The continuous readout reimplements the decoding upstream performs inside
+    `predict_action`, against constants that can move between model revisions.
+    Reproducing the executable action bit for bit on real inputs is the
+    condition under which the expected-bin value may be trusted.
+
+    Args:
+        samples: iterable of (image, instruction) pairs.
+
+    Returns a summary with the number checked, the number matching, the largest
+    absolute deviation, and the smallest action-token mass observed. Raises
+    RuntimeError when any sample disagrees.
+    """
+    checked = 0
+    mismatches = []
+    max_dev = 0.0
+    min_mass = 1.0
+    for image, instruction in samples:
+        baseline = predict_action(processor, vla, image, instruction, compute_dtype,
+                                  unnorm_key=unnorm_key, do_sample=False)
+        readout = predict_action_dist(processor, vla, image, instruction, compute_dtype,
+                                      unnorm_key=unnorm_key)
+        deviation = float(np.max(np.abs(baseline - readout.action)))
+        max_dev = max(max_dev, deviation)
+        min_mass = min(min_mass, float(np.min(readout.action_mass)))
+        if deviation > 0.0:
+            mismatches.append((instruction, deviation))
+        checked += 1
+
+    summary = {
+        "checked": checked,
+        "matched": checked - len(mismatches),
+        "max_abs_deviation": max_dev,
+        "min_action_mass": min_mass,
+    }
+    if verbose:
+        print(f"[verify_readout] {summary['matched']}/{checked} exact | "
+              f"max deviation {max_dev:.3e} | min action-token mass {min_mass:.4f}")
+    if mismatches:
+        raise RuntimeError(
+            f"continuous readout disagreed with predict_action on "
+            f"{len(mismatches)}/{checked} samples (max deviation {max_dev:.3e}). "
+            "The decoding constants in OpenVLA's remote code have most likely "
+            "changed; re-check describe_action_space before using c* columns."
+        )
+    return summary
+
+
+# --------------------------------------------------------------------------- #
 # Reproducibility: run conditions + CSV logging
 # --------------------------------------------------------------------------- #
 def _pkg(name: str) -> str:
@@ -223,6 +380,7 @@ def append_prediction_log(
     meta: dict,
     unnorm_key: str = DEFAULT_UNNORM_KEY,
     do_sample: bool = False,
+    readout: ActionReadout | None = None,
     **extra,
 ) -> dict:
     """Append one prediction plus its run conditions to a CSV.
@@ -230,6 +388,13 @@ def append_prediction_log(
     The header is written from the first row's keys, so keep the columns
     consistent: when you add probe fields later (scene_id, distractor_count,
     spatial_term), pass them via **extra in the SAME order every time.
+
+    When `readout` is supplied, the continuous expected-bin action (`c0` to
+    `c6`), the argmax bin indices (`b0` to `b6`), the per-dimension bin
+    confidence (`p0` to `p6`) and entropy (`h0` to `h6`), and the minimum
+    action-token mass are written alongside the argmax action. The `a*` columns
+    keep their meaning either way, so logs from before the continuous readout
+    remain comparable.
     """
     row = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -238,6 +403,7 @@ def append_prediction_log(
         "do_sample": do_sample,
         **meta,
         **{f"a{i}": float(action[i]) for i in range(len(action))},
+        **(readout.to_log_fields() if readout is not None else {}),
         **extra,
     }
     os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import re
+from dataclasses import dataclass
 
 from data import (
     ANTONYM_PAIRS,
@@ -193,12 +194,46 @@ def _load_owl():
     return _OWL_CACHE["owl"]
 
 
-def count_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THRESH):
-    """Return the per-box detection scores for `noun` in `image` above threshold.
+@dataclass
+class Instance:
+    """One detected instance of the queried noun.
+
+    Attributes:
+        score: detection confidence.
+        box: (x_min, y_min, x_max, y_max) in pixels.
+    """
+
+    score: float
+    box: tuple[float, float, float, float]
+
+    @property
+    def center_x(self) -> float:
+        return 0.5 * (self.box[0] + self.box[2])
+
+    @property
+    def center_y(self) -> float:
+        return 0.5 * (self.box[1] + self.box[3])
+
+    @property
+    def width(self) -> float:
+        return self.box[2] - self.box[0]
+
+    @property
+    def height(self) -> float:
+        return self.box[3] - self.box[1]
+
+
+def detect_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THRESH):
+    """Detect instances of `noun` in `image`, returning scores with boxes.
 
     `image` may be a PIL image or an HxWx3 array. The query is the target noun
-    phrased as "a photo of a <noun>", the standard OWLv2 prompt form. Scores are
-    returned in descending order.
+    phrased as "a photo of a <noun>", the standard OWLv2 prompt form. Instances
+    are returned in descending score order.
+
+    The boxes are what the duplicate-target proposal discards and the scene
+    construction needs: the position of each instance is what defines the
+    expected direction for a scene, so it is recorded rather than inferred from
+    the instruction.
     """
     import torch
     from PIL import Image
@@ -222,9 +257,22 @@ def count_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THR
     results = post_process(
         outputs, target_sizes=target_sizes, threshold=score_thresh
     )[0]
-    scores = [float(s) for s in results["scores"].tolist()]
-    scores.sort(reverse=True)
-    return scores
+    instances = [
+        Instance(score=float(score), box=tuple(float(v) for v in box))
+        for score, box in zip(results["scores"].tolist(), results["boxes"].tolist())
+    ]
+    instances.sort(key=lambda inst: inst.score, reverse=True)
+    return instances
+
+
+def count_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THRESH):
+    """Return the per-box detection scores for `noun` in `image` above threshold.
+
+    Thin wrapper over `detect_instances` for callers that need only the scores.
+    Scores are returned in descending order.
+    """
+    return [inst.score for inst in
+            detect_instances(image, noun, score_thresh=score_thresh)]
 
 
 def run_auto_pass(
