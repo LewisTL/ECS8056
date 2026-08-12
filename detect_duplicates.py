@@ -44,6 +44,10 @@ from data import (
 # hard dependency is introduced beyond the pinned transformers install.
 OWLV2_CHECKPOINT = "google/owlv2-base-patch16-ensemble"
 
+# Box-prompted segmentation checkpoint, used to cut an instance along its own
+# outline rather than along its bounding box. Also ships with transformers.
+SAM_CHECKPOINT = "facebook/sam-vit-base"
+
 # Detection and decision thresholds. A box is
 # only counted when its score clears DEFAULT_SCORE_THRESH. The proposal is then
 # decided from the second-highest surviving score: two confident instances imply
@@ -194,6 +198,67 @@ def _load_owl():
     return _OWL_CACHE["owl"]
 
 
+def _load_sam():
+    """Load and cache the segmentation model, or None when it is unavailable.
+
+    Returning None rather than raising keeps scene construction runnable when the
+    checkpoint cannot be fetched: the caller falls back to a box cutout and
+    records which was used, so a degraded stimulus is visible in the manifest
+    instead of stopping the run.
+    """
+    if "sam" in _OWL_CACHE:
+        return _OWL_CACHE["sam"]
+    try:
+        import torch
+        from transformers import SamModel, SamProcessor
+
+        processor = SamProcessor.from_pretrained(SAM_CHECKPOINT)
+        model = SamModel.from_pretrained(SAM_CHECKPOINT)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device).eval()
+        loaded = (processor, model, device)
+    except Exception as exc:  # noqa: BLE001 - reported, not silently swallowed
+        print(f"[detect_duplicates] segmentation unavailable ({exc}); "
+              "scene construction will fall back to box cutouts")
+        loaded = None
+    _OWL_CACHE["sam"] = loaded
+    return loaded
+
+
+def padded_target_size(width: int, height: int) -> tuple[int, int]:
+    """The (height, width) OWLv2 box coordinates are normalised against.
+
+    `Owlv2ImageProcessor` pads the image to a square of side `max(height,
+    width)` with grey on the bottom and right before resizing, so the predicted
+    boxes are fractions of that padded square rather than of the original frame.
+    Passing the original size to `post_process_object_detection` scales the
+    shorter axis by too small a factor: on a 640x480 frame every box is pulled
+    upward by a quarter of its distance from the top and loses a quarter of its
+    height, which is enough to cut a patch of background instead of the object.
+
+    Padding is applied to the bottom and right only, so the origin is shared and
+    no offset correction is needed once both axes use the square's side.
+    """
+    side = int(max(width, height))
+    return side, side
+
+
+def clip_box(box, width: int, height: int) -> tuple[float, float, float, float]:
+    """Clamp a box to the frame, ordering the corners.
+
+    A box may legitimately extend into the padded region, which does not exist
+    in the original frame, so predictions are clipped back to real pixels.
+    """
+    x0, x1 = sorted((float(box[0]), float(box[2])))
+    y0, y1 = sorted((float(box[1]), float(box[3])))
+    return (
+        min(max(x0, 0.0), float(width)),
+        min(max(y0, 0.0), float(height)),
+        min(max(x1, 0.0), float(width)),
+        min(max(y1, 0.0), float(height)),
+    )
+
+
 @dataclass
 class Instance:
     """One detected instance of the queried noun.
@@ -247,7 +312,8 @@ def detect_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_TH
     inputs = processor(text=[[query]], images=image, return_tensors="pt").to(device)
     with torch.no_grad():
         outputs = model(**inputs)
-    target_sizes = torch.tensor([image.size[::-1]], device=device)
+    # Boxes are normalised against the padded square, not the frame.
+    target_sizes = torch.tensor([padded_target_size(*image.size)], device=device)
     # The combined `Owlv2Processor` gained `post_process_object_detection` only in
     # later transformers releases; on the pinned build it lives on the wrapped
     # image processor, so resolve whichever is present.
@@ -258,11 +324,54 @@ def detect_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_TH
         outputs, target_sizes=target_sizes, threshold=score_thresh
     )[0]
     instances = [
-        Instance(score=float(score), box=tuple(float(v) for v in box))
+        Instance(score=float(score), box=clip_box(box, *image.size))
         for score, box in zip(results["scores"].tolist(), results["boxes"].tolist())
     ]
     instances.sort(key=lambda inst: inst.score, reverse=True)
     return instances
+
+
+def segment_instance(image, box):
+    """Mask of the object inside `box`, or None when segmentation is unavailable.
+
+    Returns a boolean HxW array covering the whole frame, true on the object.
+
+    A bounding box is a poor cutout for compositing: the rectangle carries the
+    table, shadows, and any neighbouring object that happens to fall inside it,
+    so the pasted copy reads as a pasted rectangle rather than as a second
+    object. Prompting SAM with the detected box gives the instance outline, and
+    compositing along that outline leaves only the object itself.
+
+    The box prompt is what makes this reliable without supervision: the region
+    to segment is already known from detection, so the model is only asked to
+    find the boundary within it rather than to decide what is salient.
+    """
+    import numpy as np
+    import torch
+    from PIL import Image
+
+    if not isinstance(image, Image.Image):
+        image = Image.fromarray(image)
+    image = image.convert("RGB")
+
+    loaded = _load_sam()
+    if loaded is None:
+        return None
+    processor, model, device = loaded
+
+    prompt = [[[float(v) for v in clip_box(box, *image.size)]]]
+    inputs = processor(image, input_boxes=prompt, return_tensors="pt").to(device)
+    with torch.no_grad():
+        outputs = model(**inputs, multimask_output=False)
+    masks = processor.image_processor.post_process_masks(
+        outputs.pred_masks.cpu(),
+        inputs["original_sizes"].cpu(),
+        inputs["reshaped_input_sizes"].cpu(),
+    )
+    mask = np.asarray(masks[0][0][0], dtype=bool)
+    # An empty mask is a failure, not a valid empty object, so it is reported as
+    # unavailable and the caller falls back to the box.
+    return mask if mask.any() else None
 
 
 def count_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THRESH):

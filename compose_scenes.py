@@ -44,9 +44,9 @@ import os
 from dataclasses import asdict, dataclass
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 
-from data import is_lateral_term, make_pair
+from data import CATEGORY_REFERENT, is_lateral_term, make_pair
 
 # Sign relating image x to the lateral action component: +1 if a target further
 # right in the image implies a larger dx. Identity until the mirror control
@@ -65,10 +65,26 @@ CONFIGURATIONS = (CONFIG_OPPOSITE, CONFIG_SAME_LEFT, CONFIG_SAME_RIGHT)
 # it. Several phrasings are tried because open-vocabulary detection is sensitive
 # to wording.
 GRIPPER_QUERIES = ("robot gripper", "robot arm", "robotic arm")
-GRIPPER_SCORE_THRESH = 0.08
+# Raised from a permissive value: at a very low threshold the detector almost
+# always returns something, so `gripper_source` reported `detected` even when the
+# box was noise and the declared fallback effectively never fired. The same-side
+# configurations are defined relative to this position, so a spurious box
+# silently mislabels the arrangement, which is worse than a recorded fallback.
+GRIPPER_SCORE_THRESH = 0.15
+# The arm enters these frames from above, so a box confined to the lower part of
+# the image is not the arm however confident the detector is.
+GRIPPER_MAX_CENTER_Y_FRACTION = 0.75
 
 GRIPPER_SOURCE_DETECTED = "detected"
 GRIPPER_SOURCE_FALLBACK = "image_center"
+
+# How the duplicate was cut out. A bounding box carries the table and any
+# neighbouring object that falls inside the rectangle, so the copy reads as a
+# pasted rectangle; the instance mask carries the object's own outline. Which was
+# used is recorded per scene rather than assumed, because a box cutout is a
+# weaker stimulus and the validation sample should be readable against it.
+CUTOUT_MASK = "mask"
+CUTOUT_BOX = "box"
 
 # Compositing defaults.
 DEFAULT_PADDING = 4        # pixels of context kept around the detected box
@@ -92,7 +108,7 @@ CONSTRUCTED_FIELDS = [
     "offset_a_px", "offset_b_px", "separation_px",
     "target_sign_a_image", "target_sign_b_image",
     "source_box", "paste_box", "source_score",
-    "padding", "feather", "seed",
+    "cutout_mode", "padding", "feather", "seed",
 ]
 
 
@@ -242,12 +258,13 @@ def plan_placement(
 # --------------------------------------------------------------------------- #
 # Compositing
 # --------------------------------------------------------------------------- #
-def _feather_mask(size, feather: int) -> Image.Image:
-    """Alpha mask that fades to zero at the patch border.
+def _rectangle_alpha(size, feather: int) -> Image.Image:
+    """Alpha that fades to zero at the patch border.
 
-    A hard-edged paste leaves a rectangular seam that reads as an artefact. The
-    ramp blends the patch background into the surrounding table, which matters
-    because the patch background is itself table taken from the same frame.
+    The fallback used when no instance mask is available. It blends the patch
+    background into the surrounding table, which works only because the patch
+    background is itself table from the same frame, and it is visibly a
+    rectangle wherever that assumption fails. `CUTOUT_BOX` records its use.
     """
     width, height = size
     ramp_x = np.ones(width)
@@ -267,11 +284,36 @@ def _feather_mask(size, feather: int) -> Image.Image:
     return Image.fromarray((alpha * 255).astype(np.uint8), mode="L")
 
 
-def cut_patch(image: Image.Image, box, padding: int = DEFAULT_PADDING):
+def _mask_alpha(mask, feather: int) -> Image.Image:
+    """Alpha from an instance mask, softened at the outline.
+
+    The mask is the object's own silhouette, so the paste carries the object and
+    not the table around it. A blur of the boundary avoids the hard, aliased
+    edge that reads as a cutout, while the interior stays fully opaque: blurring
+    alone would make a small object semi-transparent, so the core is restored
+    after the blur.
+    """
+    alpha = np.asarray(mask, dtype=bool)
+    out = Image.fromarray((alpha * 255).astype(np.uint8), mode="L")
+    span = max(int(feather), 0)
+    if span > 0:
+        blurred = out.filter(ImageFilter.GaussianBlur(radius=span / 2.0))
+        merged = np.maximum(np.asarray(blurred, dtype=np.uint8),
+                            (alpha * 255).astype(np.uint8))
+        out = Image.fromarray(merged, mode="L")
+    return out
+
+
+def cut_patch(image: Image.Image, box, padding: int = DEFAULT_PADDING, mask=None):
     """Crop the instance with a little surrounding context.
 
-    Returns (patch, crop_box). The context is what lets the feathered paste blend
-    into the table rather than sitting on a visible rectangle.
+    Returns (patch, crop_box, patch_alpha). `patch_alpha` is the object's
+    silhouette within the crop when `mask` is given, and None otherwise, in
+    which case the caller falls back to a rectangular blend.
+
+    The context margin is kept in both cases: with a mask it gives the softened
+    outline somewhere to fall off, and without one it is all that blends the
+    rectangle into the table.
     """
     x0, y0, x1, y1 = box
     crop = (
@@ -280,7 +322,11 @@ def cut_patch(image: Image.Image, box, padding: int = DEFAULT_PADDING):
         min(int(x1) + padding, image.width),
         min(int(y1) + padding, image.height),
     )
-    return image.crop(crop), crop
+    patch = image.crop(crop)
+    if mask is None:
+        return patch, crop, None
+    window = np.asarray(mask, dtype=bool)[crop[1]:crop[3], crop[0]:crop[2]]
+    return patch, crop, window
 
 
 def paste_duplicate(
@@ -291,19 +337,33 @@ def paste_duplicate(
     padding: int = DEFAULT_PADDING,
     feather: int = DEFAULT_FEATHER,
     mirror: bool = True,
+    mask=None,
 ):
-    """Composite a copy of the boxed instance at `x_target`.
+    """Composite a copy of the instance at `x_target`.
 
     The copy is horizontally mirrored by default, so the duplicate reads as a
     second object of the same kind rather than as a repeated cutout, and its
     shading remains consistent with a scene lit from one side. Vertical position
     is held at the source's, keeping the duplicate on the same table plane.
 
-    Returns (composited image, paste_box).
+    When `mask` is given the copy is cut along the object's outline, so only the
+    object is transferred. Without it the whole box is transferred, including
+    whatever background and neighbouring objects fall inside the rectangle.
+
+    Returns (composited image, paste_box, cutout_mode).
     """
-    patch, crop = cut_patch(image, box, padding=padding)
+    patch, crop, window = cut_patch(image, box, padding=padding, mask=mask)
     if mirror:
         patch = patch.transpose(Image.FLIP_LEFT_RIGHT)
+        if window is not None:
+            window = window[:, ::-1]
+
+    if window is not None and window.any():
+        alpha = _mask_alpha(window, feather)
+        mode = CUTOUT_MASK
+    else:
+        alpha = _rectangle_alpha(patch.size, feather)
+        mode = CUTOUT_BOX
 
     width, height = patch.size
     left = int(round(x_target - width / 2.0))
@@ -312,31 +372,41 @@ def paste_duplicate(
     top = max(0, min(top, image.height - height))
 
     out = image.copy()
-    out.paste(patch, (left, top), _feather_mask(patch.size, feather))
-    return out, (left, top, left + width, top + height)
+    out.paste(patch, (left, top), alpha)
+    return out, (left, top, left + width, top + height), mode
 
 
 # --------------------------------------------------------------------------- #
 # Gripper localisation
 # --------------------------------------------------------------------------- #
 def locate_gripper(image, *, queries=GRIPPER_QUERIES,
-                   score_thresh: float = GRIPPER_SCORE_THRESH):
+                   score_thresh: float = GRIPPER_SCORE_THRESH,
+                   max_center_y_fraction: float = GRIPPER_MAX_CENTER_Y_FRACTION):
     """Estimate the start position's image x.
 
     Returns (x, source, score). Falls back to the image centre when no query
-    detects anything, since a wrong-but-declared fallback is safer than a
+    detects the arm, since a wrong-but-declared fallback is safer than a
     confident guess: the `gripper_source` column records which was used, and the
     validation sample reports how often detection agreed with a human.
+
+    Candidates whose centre sits below `max_center_y_fraction` of the frame are
+    discarded. The arm enters from above, so a low box is a tabletop object the
+    query happened to score, and accepting it would place the start position on
+    the wrong side of the scene while still reporting a confident detection.
     """
     from detect_duplicates import detect_instances
 
     if not isinstance(image, Image.Image):
         image = Image.fromarray(image)
+    cutoff = float(image.height) * max_center_y_fraction
     best = None
     for query in queries:
-        found = detect_instances(image, query, score_thresh=score_thresh)
-        if found and (best is None or found[0].score > best.score):
-            best = found[0]
+        for found in detect_instances(image, query, score_thresh=score_thresh):
+            if found.center_y > cutoff:
+                continue
+            if best is None or found.score > best.score:
+                best = found
+            break
     if best is None:
         return float(image.width) / 2.0, GRIPPER_SOURCE_FALLBACK, 0.0
     return float(best.center_x), GRIPPER_SOURCE_DETECTED, float(best.score)
@@ -376,6 +446,7 @@ class ConstructedScene:
     source_box: str
     paste_box: str
     source_score: float
+    cutout_mode: str
     padding: int
     feather: int
     seed: int
@@ -398,12 +469,16 @@ def build_scene(
     min_gap: float = DEFAULT_MIN_GAP,
     margin: int = DEFAULT_MARGIN,
     seed: int = 0,
+    mask=None,
 ):
     """Construct one two-instance trial from a single-instance base frame.
 
     Returns (image, ConstructedScene) or None when the configuration cannot be
     realised in this frame, for example because the duplicate would leave the
     image or land on the wrong side of the start position.
+
+    `mask` is the source instance's silhouette, used to cut the duplicate along
+    the object's outline instead of its bounding box.
     """
     made = make_pair(instruction)
     if made is None:
@@ -427,8 +502,9 @@ def build_scene(
     if placement is None:
         return None
 
-    image, paste_box = paste_duplicate(
-        base_image, source_box, placement.x_pasted, padding=padding, feather=feather
+    image, paste_box, cutout_mode = paste_duplicate(
+        base_image, source_box, placement.x_pasted, padding=padding,
+        feather=feather, mask=mask,
     )
     construct_id = f"c{int(base_scene_id):06d}_{configuration}_{term}"
     scene = ConstructedScene(
@@ -459,6 +535,7 @@ def build_scene(
         source_box=",".join(f"{v:.1f}" for v in (x0, y0, x1, y1)),
         paste_box=",".join(f"{v:.1f}" for v in paste_box),
         source_score=float(source_score),
+        cutout_mode=cutout_mode,
         padding=padding,
         feather=feather,
         seed=seed,
@@ -499,8 +576,12 @@ def load_constructed_manifest(out_dir: str):
 SINGLE_HIGH = 0.25
 SINGLE_SECOND_MAX = 0.15
 
+# Only referent-selection instructions can seed a construction; see
+# `select_base_scenes` for why placement instructions cannot.
+DEFAULT_CATEGORIES = (CATEGORY_REFERENT,)
 
-def select_base_scenes(manifest_rows, *, categories=None, limit=None):
+
+def select_base_scenes(manifest_rows, *, categories=DEFAULT_CATEGORIES, limit=None):
     """Bridge scenes eligible to seed a construction.
 
     Requires a minimal pair on a lateral term, since the construction places
@@ -508,6 +589,17 @@ def select_base_scenes(manifest_rows, *, categories=None, limit=None):
     duplicate-target labels are deliberately not consulted: the construction
     supplies the property those labels were filtering for, so requiring them
     would reimpose the scarcity the constructed set exists to escape.
+
+    The category filter defaults to `referent_selection` and is not optional in
+    practice. In a placement instruction the spatial term governs the landmark
+    rather than the object being moved ("move the pot to the right of the
+    spoon"), so duplicating the moved object produces two pots while the swapped
+    term still describes a destination beside the spoon: the term does not select
+    between the two instances and the trial measures nothing. Duplicating the
+    landmark instead does not help either, because the first action is the reach
+    toward the pot and is identical for both variants, which is the same reason
+    placement scenes are excluded from the analysis. Passing `categories=None`
+    disables the filter and is supported only for inspecting the wider pool.
     """
     selected = []
     for row in manifest_rows:
@@ -534,7 +626,7 @@ def run_construction(
     out_dir: str,
     *,
     manifest_rows=None,
-    categories=None,
+    categories=DEFAULT_CATEGORIES,
     configurations=CONFIGURATIONS,
     limit=None,
     padding: int = DEFAULT_PADDING,
@@ -542,6 +634,7 @@ def run_construction(
     min_gap: float = DEFAULT_MIN_GAP,
     margin: int = DEFAULT_MARGIN,
     detect_gripper: bool = True,
+    segment: bool = True,
     seed: int = 0,
     verbose: bool = True,
 ) -> dict:
@@ -554,7 +647,8 @@ def run_construction(
     scenes were rejected, so the yield is inspectable rather than silent.
     """
     from data import load_manifest
-    from detect_duplicates import detect_instances, extract_target_noun
+    from detect_duplicates import (detect_instances, extract_target_noun,
+                                   segment_instance)
 
     rows = manifest_rows if manifest_rows is not None else load_manifest(cache_dir)
     candidates = select_base_scenes(rows, categories=categories, limit=limit)
@@ -595,6 +689,10 @@ def run_construction(
             x_gripper, gripper_source, gripper_score = (
                 base_image.width / 2.0, GRIPPER_SOURCE_FALLBACK, 0.0)
 
+        # Segment once per base frame: the mask depends on the source instance,
+        # not on where the duplicate is placed, so all configurations share it.
+        mask = segment_instance(base_image, found[0].box) if segment else None
+
         built_any = False
         for configuration in configurations:
             result = build_scene(
@@ -602,7 +700,7 @@ def run_construction(
                 found[0].box, found[0].score, configuration,
                 x_gripper=x_gripper, gripper_source=gripper_source,
                 gripper_score=gripper_score, padding=padding, feather=feather,
-                min_gap=min_gap, margin=margin, seed=seed,
+                min_gap=min_gap, margin=margin, seed=seed, mask=mask,
             )
             if result is None:
                 continue
@@ -616,18 +714,26 @@ def run_construction(
     write_constructed_manifest(scenes, out_dir)
 
     by_config: dict = {}
+    by_cutout: dict = {}
     for scene in scenes:
         by_config[scene.configuration] = by_config.get(scene.configuration, 0) + 1
+        by_cutout[scene.cutout_mode] = by_cutout.get(scene.cutout_mode, 0) + 1
     summary = {
         "candidates": len(candidates),
         "constructed": len(scenes),
         "by_configuration": by_config,
+        "by_cutout": by_cutout,
         "rejected": rejects,
     }
     if verbose:
         print(f"[run_construction] {summary['candidates']} candidate frames -> "
               f"{summary['constructed']} constructed scenes {by_config}")
+        print(f"[run_construction] cutouts: {by_cutout}")
         print(f"[run_construction] rejected: {rejects}")
+        if by_cutout.get(CUTOUT_BOX):
+            print(f"[run_construction] {by_cutout[CUTOUT_BOX]} scenes fell back to "
+                  "a box cutout; those duplicates carry background as well as the "
+                  "object and read as pasted rectangles")
     return summary
 
 
@@ -648,7 +754,10 @@ VALIDATION_NAME = "validation_sample.csv"
 VALIDATION_FIELDS = [
     "construct_id", "configuration", "instr_a",
     # Recorded by the pipeline, shown to the annotator only after labelling.
-    "auto_configuration", "auto_gripper_source",
+    # `auto_cutout_mode` is carried so that a judgement of the paste can be read
+    # against how the duplicate was cut: a box cutout is expected to look worse,
+    # and pooling the two would hide that.
+    "auto_configuration", "auto_gripper_source", "auto_cutout_mode",
     # Hand labels.
     "human_configuration",   # opposite | same_side_left | same_side_right | unclear
     "human_two_instances",   # yes | no: are two instances of the noun visible
@@ -699,6 +808,7 @@ def draw_validation_sample(scenes, n: int = 50, seed: int = 0):
         "instr_a": row["instr_a"],
         "auto_configuration": row["configuration"],
         "auto_gripper_source": row.get("gripper_source", ""),
+        "auto_cutout_mode": row.get("cutout_mode", ""),
         "human_configuration": VALIDATION_UNLABELLED,
         "human_two_instances": VALIDATION_UNLABELLED,
         "human_gripper_ok": VALIDATION_UNLABELLED,
@@ -748,6 +858,11 @@ def validation_agreement(rows) -> dict:
     agreement bears mainly on the same-side configurations, which are defined
     relative to the start position, so a low value there weakens the decisive
     comparison specifically rather than the whole constructed set.
+
+    The plausibility of the paste is also reported per cutout mode. An outline
+    cutout and a bounding-box cutout are different stimuli, the second visibly
+    worse, so a pooled rate would average away the distinction that decides
+    whether any box fallbacks are usable.
     """
     labelled = [r for r in rows if r.get("human_configuration")]
     out = {
@@ -758,6 +873,7 @@ def validation_agreement(rows) -> dict:
         "gripper_agreement": float("nan"),
         "paste_plausible_rate": float("nan"),
         "by_configuration": {},
+        "by_cutout": {},
     }
     if not labelled:
         return out
@@ -780,6 +896,16 @@ def validation_agreement(rows) -> dict:
             "n": len(group),
             "agreement": sum(1 for r in group
                              if r["human_configuration"] == configuration) / len(group),
+        }
+
+    for mode in sorted({r.get("auto_cutout_mode", "") for r in labelled} - {""}):
+        group = [r for r in labelled if r.get("auto_cutout_mode") == mode]
+        answered = [r for r in group if r.get("human_paste_plausible")]
+        out["by_cutout"][mode] = {
+            "n": len(group),
+            "paste_plausible_rate": (
+                sum(1 for r in answered if r["human_paste_plausible"] == "yes")
+                / len(answered) if answered else float("nan")),
         }
     return out
 
