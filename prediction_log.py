@@ -38,6 +38,18 @@ LEADING_LOG_FIELDS = ("timestamp", "instruction", "unnorm_key", "do_sample")
 RUN_METADATA_FIELDS = ("gpu_name", "gpu_capability", "dtype", "seed", "torch",
                        "transformers", "bitsandbytes")
 
+# The probe's `**extra` keys, in the order the sweep passes them. Declared here
+# rather than in a notebook cell because three places need to agree on it: the
+# header the migration writes, the rows the sweep appends, and the schema a repair
+# reads an existing log under. A copy in a notebook would be a fourth declaration
+# able to drift from the other three.
+PROBE_EXTRA_FIELDS = (
+    "scene_id", "pair_id", "role", "frame", "scene_source", "condition",
+    "image_transform", "image_scene_id", "configuration", "expected_sign",
+    "target_sign_a", "target_sign_b", "spatial_term", "axis", "axis_index",
+    "category", "feasible_both", "duplicate_target", "sample_idx",
+)
+
 # Resolved header per log path, so the header is not re-read from a mounted drive
 # before each of several thousand appends.
 _SCHEMA_CACHE: dict = {}
@@ -59,6 +71,11 @@ def canonical_log_fields(extra_fields=(), *, with_readout: bool = True,
         fields += readout_log_fields(n_dims)
     fields += [f for f in extra_fields if f not in fields]
     return fields
+
+
+def probe_log_fields() -> list[str]:
+    """Full column order of the contrastive probe's log."""
+    return canonical_log_fields(PROBE_EXTRA_FIELDS)
 
 
 def widen_log(csv_path: str, extra_fields, verbose: bool = False) -> list[str]:
@@ -147,6 +164,58 @@ def inspect_log(csv_path: str) -> dict:
         "widths": dict(sorted(widths.items())),
         "consistent": set(widths) <= {len(header)},
     }
+
+
+def ensure_readable(csv_path: str, schemas=None, verbose: bool = True) -> dict:
+    """Make a log parseable, repairing it only when nothing would be lost.
+
+    Called before reading the log in any notebook that reads it. A log written
+    before the header was declared in full can hold rows wider than its own
+    header, which no CSV reader will parse, and repairing it is a file operation
+    that re-runs nothing on GPU. On a consistent log this does nothing.
+
+    The repair goes ahead only when every field count present is accounted for by
+    the file's header or one of `schemas`, which defaults to the probe schema. An
+    unaccounted width would be dropped by `repair_log`, so rather than rewrite the
+    file and lose those rows, this reports what it found and leaves the log alone
+    for the caller to look at.
+    """
+    if not os.path.exists(csv_path):
+        return {"status": "missing", "path": csv_path}
+
+    report = inspect_log(csv_path)
+    if report["consistent"]:
+        if verbose:
+            print(f"{csv_path}\n  {report['header_fields']} columns, "
+                  f"{sum(e['rows'] for e in report['widths'].values())} rows, "
+                  "consistent")
+        return {"status": "consistent", "path": csv_path, "report": report}
+
+    schemas = [list(s) for s in (schemas if schemas is not None
+                                 else [probe_log_fields()])]
+    if verbose:
+        print(f"{csv_path}\n  header declares {report['header_fields']} columns "
+              "but the rows disagree:")
+        for width, entry in report["widths"].items():
+            print(f"    {entry['rows']:6} rows of {width:3} fields "
+                  f"(first at line {entry['first_line']})")
+
+    known = {report["header_fields"]} | {len(s) for s in schemas}
+    unknown = {w: e["rows"] for w, e in report["widths"].items() if w not in known}
+    if unknown:
+        raise ValueError(
+            f"{csv_path} holds rows of unrecognised width {unknown}, matching "
+            f"neither its {report['header_fields']}-column header nor any known "
+            f"schema (widths {sorted(len(s) for s in schemas)}). Repairing would "
+            "drop them, so the log is unchanged. Inspect those lines, then call "
+            "repair_log directly with a schema for them."
+        )
+
+    summary = repair_log(csv_path, schemas, verbose=verbose)
+    if not inspect_log(csv_path)["consistent"]:
+        raise ValueError(f"{csv_path} is still inconsistent after repair")
+    summary["status"] = "repaired"
+    return summary
 
 
 def repair_log(csv_path: str, schemas, out_path: str | None = None,

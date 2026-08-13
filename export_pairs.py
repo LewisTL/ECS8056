@@ -38,7 +38,7 @@ import json
 import numpy as np
 import pandas as pd
 
-from prediction_log import inspect_log
+from prediction_log import ensure_readable
 
 # Column names produced by model.append_prediction_log / data.cache_records.
 ACTION_COLS = [f"a{i}" for i in range(7)]
@@ -135,27 +135,22 @@ def manifest_key(scene_id: str) -> str | None:
     return str(int(body)) if body.isdigit() else None
 
 
-def load_inputs(pred_path: str, manifest_path: str | None = None):
+def load_inputs(pred_path: str, manifest_path: str | None = None,
+                verbose: bool = True):
     """Read the prediction log and (optionally) the manifest as DataFrames.
 
-    A log appended to across a schema change can hold rows wider than its header.
-    The parser then fails with a line number alone, which does not say what is
-    wrong or what to do, so the raw error is replaced with the field counts found
-    and a pointer to the repair.
+    A log appended to across a schema change can hold rows wider than its header,
+    which no CSV reader will parse. `ensure_readable` repairs that in place, which
+    is a file operation and re-runs nothing on GPU, and does nothing to a log that
+    is already consistent. It refuses to touch a log holding rows it cannot account
+    for, so the repair cannot lose data.
+
+    Repairing here rather than raising means every notebook that reads the log is
+    covered, including the ones that never load the model and would otherwise have
+    to load a 7B checkpoint to fix a CSV.
     """
-    try:
-        preds = pd.read_csv(pred_path)
-    except pd.errors.ParserError as exc:
-        report = inspect_log(pred_path)
-        widths = {w: e["rows"] for w, e in report["widths"].items()}
-        raise ValueError(
-            f"{pred_path} is not readable as a table: its header declares "
-            f"{report['header_fields']} columns but its rows have field counts "
-            f"{widths}. This happens when a log is appended to after its schema "
-            "widened. Repair it with prediction_log.repair_log, passing the "
-            "current schema from prediction_log.canonical_log_fields (the "
-            "'Check the log is readable' cell of notebook 03 does this)."
-        ) from exc
+    ensure_readable(pred_path, verbose=verbose)
+    preds = pd.read_csv(pred_path)
     for col, default in GROUP_DEFAULTS.items():
         if col not in preds.columns:
             print(f"[load_inputs] prediction log has no {col!r} column; "
