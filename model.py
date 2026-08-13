@@ -25,7 +25,6 @@ Design choices:
 
 from __future__ import annotations
 
-import csv
 import os
 import random
 from dataclasses import dataclass
@@ -44,6 +43,7 @@ from action_bins import (
     bin_widths,
     readout_from_logits,
 )
+from prediction_log import append_row
 
 MODEL_ID = "openvla/openvla-7b"
 DEFAULT_UNNORM_KEY = "bridge_orig"  # action de-normalisation stats for BridgeData V2
@@ -360,7 +360,11 @@ def _pkg(name: str) -> str:
 
 
 def run_metadata(compute_dtype: torch.dtype, seed: int = DEFAULT_SEED) -> dict:
-    """Conditions every prediction should be stamped with."""
+    """Conditions every prediction should be stamped with.
+
+    The keys are `prediction_log.RUN_METADATA_FIELDS`, in that order, which a test
+    asserts so the declared schema cannot drift from what is actually written.
+    """
     gpu = detect_gpu()
     return {
         "gpu_name": gpu.name,
@@ -371,6 +375,8 @@ def run_metadata(compute_dtype: torch.dtype, seed: int = DEFAULT_SEED) -> dict:
         "transformers": _pkg("transformers"),
         "bitsandbytes": _pkg("bitsandbytes"),
     }
+
+
 
 
 def append_prediction_log(
@@ -385,9 +391,15 @@ def append_prediction_log(
 ) -> dict:
     """Append one prediction plus its run conditions to a CSV.
 
-    The header is written from the first row's keys, so keep the columns
-    consistent: when you add probe fields later (scene_id, distractor_count,
-    spatial_term), pass them via **extra in the SAME order every time.
+    Rows are written against the file's own header. A row carrying columns the
+    header lacks widens the file rather than being written at its own width: an
+    over-wide row is silently accepted by the writer and only fails later, when a
+    reader meets a line with more fields than the header promised.
+
+    Columns absent from a given row are written empty, so a log may mix rows from
+    different call shapes. That is what allows predictions logged without a
+    continuous readout, including rows migrated from an earlier schema, to sit in
+    the same file as rows that have one.
 
     When `readout` is supplied, the continuous expected-bin action (`c0` to
     `c6`), the argmax bin indices (`b0` to `b6`), the per-dimension bin
@@ -406,14 +418,7 @@ def append_prediction_log(
         **(readout.to_log_fields() if readout is not None else {}),
         **extra,
     }
-    os.makedirs(os.path.dirname(csv_path) or ".", exist_ok=True)
-    new_file = not os.path.exists(csv_path)
-    with open(csv_path, "a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(row.keys()))
-        if new_file:
-            writer.writeheader()
-        writer.writerow(row)
-    return row
+    return append_row(csv_path, row)
 
 
 if __name__ == "__main__":

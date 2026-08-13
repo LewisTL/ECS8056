@@ -38,6 +38,8 @@ import json
 import numpy as np
 import pandas as pd
 
+from prediction_log import inspect_log
+
 # Column names produced by model.append_prediction_log / data.cache_records.
 ACTION_COLS = [f"a{i}" for i in range(7)]
 CONTINUOUS_COLS = [f"c{i}" for i in range(7)]
@@ -134,8 +136,26 @@ def manifest_key(scene_id: str) -> str | None:
 
 
 def load_inputs(pred_path: str, manifest_path: str | None = None):
-    """Read the prediction log and (optionally) the manifest as DataFrames."""
-    preds = pd.read_csv(pred_path)
+    """Read the prediction log and (optionally) the manifest as DataFrames.
+
+    A log appended to across a schema change can hold rows wider than its header.
+    The parser then fails with a line number alone, which does not say what is
+    wrong or what to do, so the raw error is replaced with the field counts found
+    and a pointer to the repair.
+    """
+    try:
+        preds = pd.read_csv(pred_path)
+    except pd.errors.ParserError as exc:
+        report = inspect_log(pred_path)
+        widths = {w: e["rows"] for w, e in report["widths"].items()}
+        raise ValueError(
+            f"{pred_path} is not readable as a table: its header declares "
+            f"{report['header_fields']} columns but its rows have field counts "
+            f"{widths}. This happens when a log is appended to after its schema "
+            "widened. Repair it with prediction_log.repair_log, passing the "
+            "current schema from prediction_log.canonical_log_fields (the "
+            "'Check the log is readable' cell of notebook 03 does this)."
+        ) from exc
     for col, default in GROUP_DEFAULTS.items():
         if col not in preds.columns:
             print(f"[load_inputs] prediction log has no {col!r} column; "

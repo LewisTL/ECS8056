@@ -33,6 +33,10 @@ import numpy as np
 # absent; the continuous path must do the same or the two readouts diverge.
 EMPTY_TOKEN_ID = 29871
 
+# Degrees of freedom in an OpenVLA action: three translation, three rotation, and
+# the gripper.
+DOF = 7
+
 
 @dataclass
 class ActionReadout:
@@ -69,6 +73,20 @@ class ActionReadout:
             fields[f"h{i}"] = float(value)
         fields["action_mass_min"] = float(np.min(self.action_mass))
         return fields
+
+
+def readout_log_fields(n_dims: int = DOF) -> list[str]:
+    """Names `to_log_fields` produces, in order, without needing a prediction.
+
+    Declaring the schema apart from the data is what lets a log's full column set
+    be known before any row exists, so a file can be created with its final header
+    rather than with whichever subset the first row happened to carry.
+    """
+    return ([f"c{i}" for i in range(n_dims)]
+            + [f"b{i}" for i in range(n_dims)]
+            + [f"p{i}" for i in range(n_dims)]
+            + [f"h{i}" for i in range(n_dims)]
+            + ["action_mass_min"])
 
 
 def action_token_ids(vocab_size: int, n_bins: int) -> np.ndarray:

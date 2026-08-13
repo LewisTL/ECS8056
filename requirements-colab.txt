@@ -24,3 +24,11 @@ protobuf>=6.31.1
 # Vision / arrays (usually already present on Colab, pinned loosely for safety)
 pillow>=10.0.0
 numpy>=1.24,<2.0
+
+# Automated duplicate-target proposal (detect_duplicates.py). The OWLv2
+# open-vocabulary detector ships with the transformers pin above, so no extra
+# install is required for the detector itself. Target-noun extraction prefers a
+# regex heuristic tuned to the short imperative instructions and falls back to
+# spaCy only when the heuristic finds nothing, so spaCy is optional. To enable
+# the fallback, install it and its small English model:
+#   pip install spacy && python -m spacy download en_core_web_sm

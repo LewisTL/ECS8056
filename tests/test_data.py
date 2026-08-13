@@ -28,7 +28,9 @@ from data import (
     review_summary,
     update_manifest_annotations,
 )
-from detect_duplicates import classify_counts, extract_target_noun
+from detect_duplicates import (classify_counts, clip_box,
+                               extract_manipulated_noun, extract_target_noun,
+                               padded_target_size)
 
 
 def _step(open_gripper: bool) -> dict:
@@ -314,3 +316,63 @@ def test_extract_target_noun():
     assert extract_target_noun("pick up the cup on the left") == "cup"
     assert extract_target_noun("grab the red block on the right") == "block"
     assert extract_target_noun("") is None
+
+
+def test_extract_manipulated_noun_takes_the_object_not_the_landmark():
+    """The manipulated object, which differs from the referent when a landmark is
+    present. Synthesised construction needs the object the episode demonstrates is
+    graspable, not the thing a spatial term happens to select.
+    """
+    assert extract_manipulated_noun("put the corn in the pot on the left") == "corn"
+    assert extract_manipulated_noun("take the lid off the pot") == "lid"
+    assert extract_manipulated_noun("put the sushi on the plate") == "sushi"
+    # The referent extractor disagrees on exactly these, which is the point.
+    assert extract_target_noun("put the corn in the pot on the left") == "pot"
+
+
+def test_extract_manipulated_noun_skips_modifiers_and_particles():
+    assert extract_manipulated_noun("grab the red block") == "block"
+    assert extract_manipulated_noun("move the silver pot to the left") == "pot"
+    assert extract_manipulated_noun("pick up the cup") == "cup"
+    assert extract_manipulated_noun("put down the cloth") == "cloth"
+
+
+def test_extract_manipulated_noun_rejects_state_words():
+    """An adverb read as an object would be written into a synthesised instruction."""
+    assert extract_manipulated_noun("flip the pot upright") == "pot"
+    assert extract_manipulated_noun("turn the cup over") == "cup"
+    assert extract_manipulated_noun("") is None
+
+
+def test_padded_target_size_uses_the_square_the_detector_pads_to():
+    """OWLv2 boxes are normalised against a padded square, not the frame.
+
+    The image processor pads to `max(height, width)` before resizing, so
+    unnormalising with the frame's own height scales the shorter axis by too
+    small a factor. On a 640x480 frame that pulls every box a quarter of the way
+    toward the top and costs it a quarter of its height, which is the difference
+    between cutting the object and cutting the background above it.
+    """
+    assert padded_target_size(640, 480) == (640, 640)
+    assert padded_target_size(480, 640) == (640, 640)
+    # A square frame needs no padding, so the size is unchanged.
+    assert padded_target_size(256, 256) == (256, 256)
+
+
+def test_padded_target_size_would_shift_a_tabletop_box_upward_if_ignored():
+    """The magnitude of the defect, stated as the analysis would have seen it."""
+    width, height = 640, 480
+    side = padded_target_size(width, height)[0]
+    # A box around an object sitting mid-frame, in normalised coordinates.
+    y_norm = 340.0 / side
+    correct = y_norm * side
+    naive = y_norm * height
+    assert correct - naive > 80.0
+
+
+def test_clip_box_orders_corners_and_keeps_boxes_inside_the_frame():
+    assert clip_box((10, 20, 30, 40), 100, 100) == (10.0, 20.0, 30.0, 40.0)
+    # Predictions may land in the padded region, which is not real pixels.
+    assert clip_box((-5, -5, 150, 150), 100, 80) == (0.0, 0.0, 100.0, 80.0)
+    # Reversed corners are normalised rather than producing a negative extent.
+    assert clip_box((60, 70, 20, 30), 100, 100) == (20.0, 30.0, 60.0, 70.0)
