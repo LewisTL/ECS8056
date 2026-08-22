@@ -26,12 +26,26 @@ Three configurations are produced:
     signs. This configuration is what separates the two accounts, and it cannot
     be sampled from found data.
 
+These scenes carry the experiments. The unaltered Bridge frames are held back for
+the transfer question at the end, and the harvest keeps the two roles disjoint, so
+`select_base_scenes` builds only from frames assigned the construction role.
+
+Three stages stand between a built scene and an experimental one, and each is
+recorded rather than assumed. Every scene is screened once by a human against
+criteria fixed in advance, blind to the model and before any prediction exists
+(`sync_review`, `approval_summary`). The screened set is then frozen to a fixed
+list (`select_evaluation_set`, `write_evaluation_set`) that every later stage
+reads, so the set cannot drift as review continues. And a pasted object is only
+useful if the model perceives it, which `manipulation_rate` measures rather than
+presumes.
+
 Two caveats are handled explicitly rather than assumed away. The relationship
 between image x and the sign of the lateral action is not established by the
 dataset, so the manifest records the expectation in image coordinates and the
-analysis applies the convention separately (`IMAGE_X_TO_LATERAL_SIGN`). And a
-pasted object is only useful if the model perceives it, which `manipulation_rate`
-measures rather than presumes.
+analysis applies the convention separately (`IMAGE_X_TO_LATERAL_SIGN`). And the
+screen conditions the result on stimulus quality: what is estimated is grounding
+given a well-posed and perceptible scene, so rejected scenes are kept rather than
+deleted and remain available as a check on what the screen bought.
 
 The detector is imported lazily through `detect_duplicates`, so the geometry and
 compositing helpers stay importable without a model download.
@@ -46,7 +60,8 @@ from dataclasses import asdict, dataclass
 import numpy as np
 from PIL import Image, ImageFilter
 
-from data import CATEGORY_REFERENT, is_lateral_term, make_pair
+from data import (CATEGORY_REFERENT, SPLIT_CONSTRUCTION, is_lateral_term,
+                  make_pair)
 # Only the threshold constant is taken at import time, so the detector's heavy
 # dependencies stay behind the lazy imports inside the functions that call it.
 from detect_duplicates import DEFAULT_SCORE_THRESH
@@ -714,17 +729,70 @@ def build_scene(
     return image, scene
 
 
+def _scene_row(scene) -> dict:
+    """Normalise a ConstructedScene or row dict to a manifest row."""
+    row = asdict(scene) if isinstance(scene, ConstructedScene) else dict(scene)
+    return {k: row.get(k, "") for k in CONSTRUCTED_FIELDS}
+
+
 def write_constructed_manifest(scenes, out_dir: str) -> str:
-    """Write the constructed-scene manifest, creating the directory if needed."""
+    """Write the constructed-scene manifest, replacing any existing one."""
     os.makedirs(os.path.join(out_dir, FRAMES_DIR), exist_ok=True)
     path = os.path.join(out_dir, MANIFEST_NAME)
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=CONSTRUCTED_FIELDS)
         writer.writeheader()
         for scene in scenes:
-            row = asdict(scene) if isinstance(scene, ConstructedScene) else dict(scene)
-            writer.writerow({k: row.get(k, "") for k in CONSTRUCTED_FIELDS})
+            writer.writerow(_scene_row(scene))
     print(f"[write_constructed_manifest] wrote {len(scenes)} scenes -> {path}")
+    return path
+
+
+def append_constructed_manifest(scenes, out_dir: str) -> str:
+    """Append scenes to the constructed manifest, creating the header if needed.
+
+    Construction runs for tens of minutes over thousands of detector and
+    segmentation calls, so a run that only wrote its manifest at the end would lose
+    everything to a disconnected session. Appending as scenes are built also makes
+    the file the record of what exists, which is what lets a later run resume from
+    it.
+
+    A file whose header does not cover the current schema is rewritten under the
+    union before anything is appended, rather than being appended to under assumed
+    column names.
+    """
+    os.makedirs(os.path.join(out_dir, FRAMES_DIR), exist_ok=True)
+    path = os.path.join(out_dir, MANIFEST_NAME)
+    rows = [_scene_row(scene) for scene in scenes]
+    if not rows:
+        return path
+
+    fields = list(CONSTRUCTED_FIELDS)
+    header = None
+    if os.path.isfile(path):
+        with open(path, newline="") as f:
+            header = next(csv.reader(f), None)
+    if header:
+        fields = list(CONSTRUCTED_FIELDS) + [c for c in header
+                                             if c not in CONSTRUCTED_FIELDS]
+        if header != fields:
+            with open(path, newline="") as f:
+                current = [dict(r) for r in csv.DictReader(f)]
+            tmp = path + ".tmp"
+            with open(tmp, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+                for row in current:
+                    writer.writerow({k: row.get(k, "") for k in fields})
+            os.replace(tmp, path)
+    else:
+        with open(path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=fields).writeheader()
+
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
     return path
 
 
@@ -788,12 +856,19 @@ def gate_base_frame(instances, *, single_high: float = SINGLE_HIGH,
 
 def select_base_scenes(manifest_rows, *, categories=DEFAULT_CATEGORIES, limit=None,
                        instruction_mode: str = MODE_INHERITED,
-                       template: str = SYNTHESISED_TEMPLATE):
+                       template: str = SYNTHESISED_TEMPLATE,
+                       splits=(SPLIT_CONSTRUCTION,)):
     """Bridge scenes eligible to seed a construction.
 
     Every returned row carries the instruction the trial will use, the noun to
     detect, and `instruction_source`, so the caller neither re-derives them nor
     has to know which mode produced them.
+
+    Only frames the harvest assigned to the construction role are eligible.
+    Frames reserved for validation are excluded here rather than downstream,
+    because a frame composited into an experimental stimulus cannot also stand as
+    evidence that the finding holds on unedited data. `splits=None` disables the
+    restriction and exists only for inspecting a manifest that predates the roles.
 
     In `inherited` mode the instruction is the episode's own, which must yield a
     minimal pair on a lateral term since the construction places instances left
@@ -823,9 +898,12 @@ def select_base_scenes(manifest_rows, *, categories=DEFAULT_CATEGORIES, limit=No
     if instruction_mode not in INSTRUCTION_MODES:
         raise ValueError(f"unknown instruction_mode: {instruction_mode!r}")
 
+    allowed_splits = set(splits) if splits is not None else None
     selected = []
     for row in manifest_rows:
         if not row.get("image_path"):
+            continue
+        if allowed_splits is not None and row.get("split", "") not in allowed_splits:
             continue
 
         if instruction_mode == MODE_SYNTHESISED:
@@ -856,6 +934,12 @@ def select_base_scenes(manifest_rows, *, categories=DEFAULT_CATEGORIES, limit=No
     return selected
 
 
+# Scenes are appended to the manifest in batches. A frame's PNG is named from its
+# base index and configuration, so a batch lost to a disconnected session is
+# rebuilt identically on the next run rather than duplicated.
+CONSTRUCTION_FLUSH_EVERY = 20
+
+
 def run_construction(
     cache_dir: str,
     out_dir: str,
@@ -863,7 +947,12 @@ def run_construction(
     manifest_rows=None,
     categories=DEFAULT_CATEGORIES,
     configurations=CONFIGURATIONS,
+    targets: dict | None = None,
+    overbuild: float = 1.0,
     limit=None,
+    shuffle: bool = True,
+    resume: bool = True,
+    splits=(SPLIT_CONSTRUCTION,),
     padding: int = DEFAULT_PADDING,
     feather: int = DEFAULT_FEATHER,
     min_gap: float = DEFAULT_MIN_GAP,
@@ -875,6 +964,7 @@ def run_construction(
     single_high: float = SINGLE_HIGH,
     single_second_max: float = SINGLE_SECOND_MAX,
     instruction_mode: str = MODE_INHERITED,
+    flush_every: int = CONSTRUCTION_FLUSH_EVERY,
     seed: int = 0,
     verbose: bool = True,
 ) -> dict:
@@ -882,9 +972,23 @@ def run_construction(
 
     For each eligible base frame the target noun is detected; frames holding
     anything other than exactly one confident instance are skipped, and the rest
-    seed one trial per achievable configuration. Writes the frames and the
-    manifest under `out_dir` and returns a summary of what was built and why
-    scenes were rejected, so the yield is inspectable rather than silent.
+    seed one trial per achievable configuration. Frames and manifest rows are
+    written under `out_dir` as they are built, and a summary reports what was built
+    and why scenes were rejected, so the yield is inspectable rather than silent.
+
+    `targets` gives a per-configuration count to build, multiplied by `overbuild`
+    to leave room for the scenes manual approval will reject, and the run stops once
+    every configuration has reached its goal. Without targets the whole candidate
+    pool is processed.
+
+    Candidates are shuffled under `seed` before `limit` applies. Bridge episodes are
+    ordered by scene and task, so taking a prefix of the manifest samples a few
+    domains rather than the corpus, and a truncated run would not be representative
+    of the pool it was drawn from.
+
+    `resume` skips base frames that already have scenes in the manifest, so an
+    interrupted run continues instead of rebuilding. Construction is deterministic
+    given the seed, so a rebuilt frame reproduces the scene it would have produced.
 
     The detection thresholds are arguments rather than fixed constants because
     their scale belongs to the detector, not to this data. `diagnose_detection`
@@ -899,16 +1003,56 @@ def run_construction(
             "by segmentation, so without it every frame would be rejected")
 
     rows = manifest_rows if manifest_rows is not None else load_manifest(cache_dir)
-    candidates = select_base_scenes(rows, categories=categories, limit=limit,
-                                    instruction_mode=instruction_mode)
-
-    scenes: list[ConstructedScene] = []
-    rejects = {GATE_NO_INSTANCE: 0, GATE_WEAK: 0, GATE_MULTI: 0,
-               "no_surface": 0, "no_placement": 0, "missing_frame": 0}
+    candidates = select_base_scenes(rows, categories=categories,
+                                    instruction_mode=instruction_mode,
+                                    splits=splits)
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(len(candidates))
+        candidates = [candidates[int(i)] for i in order]
+    if limit is not None:
+        candidates = candidates[:limit]
 
     os.makedirs(os.path.join(out_dir, FRAMES_DIR), exist_ok=True)
+    existing = (load_constructed_manifest(out_dir)
+                if os.path.isfile(os.path.join(out_dir, MANIFEST_NAME)) else [])
+    done_bases = {str(row["base_scene_id"]) for row in existing} if resume else set()
+    counts: dict = {}
+    for row in existing:
+        counts[row["configuration"]] = counts.get(row["configuration"], 0) + 1
+
+    goals = ({config: int(np.ceil(count * overbuild))
+              for config, count in targets.items()} if targets else {})
+
+    def goals_met() -> bool:
+        return bool(goals) and all(counts.get(config, 0) >= goal
+                                   for config, goal in goals.items())
+
+    scenes: list[ConstructedScene] = []
+    pending: list[ConstructedScene] = []
+    rejects = {GATE_NO_INSTANCE: 0, GATE_WEAK: 0, GATE_MULTI: 0,
+               "no_surface": 0, "no_placement": 0, "missing_frame": 0}
+    skipped_existing = 0
+    processed = 0
+
+    def flush() -> None:
+        if pending:
+            append_constructed_manifest(pending, out_dir)
+            pending.clear()
+
+    if goals_met():
+        if verbose:
+            print(f"[run_construction] goals already met: {counts}")
+        return {"candidates": len(candidates), "constructed": 0,
+                "by_configuration": counts, "by_cutout": {}, "rejected": rejects,
+                "skipped_existing": 0, "processed": 0, "goals": goals,
+                "goals_met": True}
 
     for row in candidates:
+        if str(row["episode_index"]) in done_bases:
+            skipped_existing += 1
+            continue
+        processed += 1
         instruction = row["instruction"]
         noun = row["target_noun"]
         frame_path = os.path.join(cache_dir, row["image_path"])
@@ -953,29 +1097,49 @@ def run_construction(
             image, scene = result
             image.save(os.path.join(out_dir, scene.image_path))
             scenes.append(scene)
+            pending.append(scene)
+            counts[configuration] = counts.get(configuration, 0) + 1
             built_any = True
         if not built_any:
             rejects["no_placement"] += 1
 
-    write_constructed_manifest(scenes, out_dir)
+        # Every configuration a frame can support is built even once its own cell
+        # is full, so the opposite and same-side scenes of a frame stay available
+        # as a pair. The selection step needs both to make the same-side against
+        # opposite contrast a within-frame comparison.
+        if len(pending) >= flush_every:
+            flush()
+            if verbose:
+                print(f"[run_construction] {processed} frames processed, "
+                      f"built {counts}")
+        if goals_met():
+            break
 
-    by_config: dict = {}
+    flush()
+
     by_cutout: dict = {}
     for scene in scenes:
-        by_config[scene.configuration] = by_config.get(scene.configuration, 0) + 1
         by_cutout[scene.cutout_mode] = by_cutout.get(scene.cutout_mode, 0) + 1
     summary = {
         "candidates": len(candidates),
+        "processed": processed,
+        "skipped_existing": skipped_existing,
         "constructed": len(scenes),
-        "by_configuration": by_config,
+        "by_configuration": counts,
         "by_cutout": by_cutout,
         "rejected": rejects,
+        "goals": goals,
+        "goals_met": goals_met(),
     }
     if verbose:
-        print(f"[run_construction] {summary['candidates']} candidate frames -> "
-              f"{summary['constructed']} constructed scenes {by_config}")
+        print(f"[run_construction] {processed} of {summary['candidates']} candidate "
+              f"frames processed ({skipped_existing} already built) -> "
+              f"{summary['constructed']} new scenes")
+        print(f"[run_construction] set now holds: {counts}")
         print(f"[run_construction] cutouts: {by_cutout}")
         print(f"[run_construction] rejected: {rejects}")
+        if goals:
+            print(f"[run_construction] goals {goals}, met {summary['goals_met']}")
         if by_cutout.get(CUTOUT_BOX):
             print(f"[run_construction] {by_cutout[CUTOUT_BOX]} scenes fell back to "
                   "a box cutout; those duplicates carry background as well as the "
@@ -1242,6 +1406,378 @@ def validation_agreement(rows) -> dict:
                 sum(1 for r in answered if r["human_paste_plausible"] == "yes")
                 / len(answered) if answered else float("nan")),
         }
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# Approval review
+# --------------------------------------------------------------------------- #
+# Every scene entering the experiments is looked at once by a human, and a scene
+# that fails is excluded with its reason recorded. This is a stimulus screen, not
+# curation of the evaluation set: it is applied before any prediction is made, it
+# is blind to the model, and its criteria are fixed in advance, whereas the
+# hand-picking this project rejected chose scenes on the property being measured
+# and left the inclusion rule unstated. What it removes are composites that failed
+# as stimuli, where the duplicate does not read as a second object of the named
+# kind, so the instruction has no second referent and the trial measures nothing.
+#
+# The consequence for interpretation is recorded rather than hidden: the estimate
+# is of grounding given a well-posed and perceptible scene, and rejected scenes stay
+# in the manifest so a sample of them can be probed as a check on what the screen
+# bought.
+#
+# Labels live in their own file keyed by construct_id. Putting them in the
+# constructed manifest would lose them the next time construction rewrote it, which
+# is the same reason feasibility labels live in the Bridge manifest rather than in a
+# notebook cell.
+REVIEW_NAME = "constructed_review.csv"
+
+DECISION_APPROVED = "approved"
+DECISION_REJECTED = "rejected"
+DECISION_UNLABELLED = ""
+
+# Why a scene was rejected. Recorded per scene so the screen reports a funnel
+# rather than a single pass rate: the reasons point at different faults, and which
+# one dominates decides what to fix. A reason that concentrates in one
+# configuration would also mean the arms of the comparison were screened
+# differently, which the summary surfaces.
+#
+# Every reason is decidable from the image and the instruction alone. Whether the
+# arrangement matches the one recorded, and whether the start position is really the
+# arm, are deliberately not screening criteria: judging them requires being shown
+# the pipeline's own answer, and a scene kept or dropped on agreement with that
+# answer would make the geometry unfalsifiable. Those two are measured instead, on a
+# random subsample labelled blind (`draw_validation_sample`), where disagreement is
+# reported rather than removed.
+REJECT_NO_SECOND_INSTANCE = "no_second_instance"   # the copy does not read as a
+                                                  # second object of the named kind
+REJECT_PASTE_IMPLAUSIBLE = "paste_implausible"     # it reads as a patch: a seam, a
+                                                  # floating object, a wrong scale
+REJECT_OBJECT_WRONG = "object_wrong"               # neither object is the noun the
+                                                  # instruction names
+REJECT_OTHER = "other"
+REJECT_REASONS = (REJECT_NO_SECOND_INSTANCE, REJECT_PASTE_IMPLAUSIBLE,
+                  REJECT_OBJECT_WRONG, REJECT_OTHER)
+
+REVIEW_FIELDS = [
+    "construct_id", "base_scene_id", "configuration", "instr_a",
+    # Carried for the funnel, never shown to the annotator: a scene judged
+    # alongside the pipeline's own answer is not an independent judgement.
+    "auto_gripper_source", "auto_cutout_mode",
+    "decision", "reject_reason", "notes",
+]
+
+
+def build_review_rows(scenes, existing=None):
+    """One review row per constructed scene, preserving any decision already made.
+
+    Covers the whole set rather than a sample, because the purpose is to decide
+    inclusion for each scene. The random sample in `draw_validation_sample` keeps
+    its separate purpose of measuring how well the recorded geometry matches human
+    reading, and that measurement has to be taken over reviewed scenes rather than
+    approved ones, since approval conditions on the arrangement being read as
+    recorded.
+    """
+    prior = {row["construct_id"]: row for row in (existing or [])}
+    rows = []
+    for scene in scenes:
+        row = asdict(scene) if isinstance(scene, ConstructedScene) else dict(scene)
+        current = {
+            "construct_id": row["construct_id"],
+            "base_scene_id": row.get("base_scene_id", ""),
+            "configuration": row.get("configuration", ""),
+            "instr_a": row.get("instr_a", ""),
+            "auto_gripper_source": row.get("gripper_source", ""),
+            "auto_cutout_mode": row.get("cutout_mode", ""),
+            "decision": DECISION_UNLABELLED,
+            "reject_reason": "",
+            "notes": "",
+        }
+        seen = prior.get(row["construct_id"])
+        if seen is not None:
+            current.update({k: v for k, v in seen.items()
+                            if k in ("decision", "reject_reason", "notes") and v})
+        rows.append(current)
+    return rows
+
+
+def write_review(rows, out_dir: str) -> str:
+    """Write the review file, replacing it in place."""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, REVIEW_NAME)
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=REVIEW_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in REVIEW_FIELDS})
+    os.replace(tmp, path)
+    return path
+
+
+def load_review(out_dir: str):
+    """Read the review file back as row dicts, or an empty list when absent."""
+    path = os.path.join(out_dir, REVIEW_NAME)
+    if not os.path.isfile(path):
+        return []
+    with open(path, newline="") as f:
+        return [{col: row.get(col, "") for col in REVIEW_FIELDS}
+                for row in csv.DictReader(f)]
+
+
+def sync_review(scenes, out_dir: str) -> list:
+    """Refresh the review file against the current set and return its rows.
+
+    Construction adds scenes across several sessions, so the review file has to
+    grow with the set while keeping the decisions already recorded.
+    """
+    rows = build_review_rows(scenes, load_review(out_dir))
+    write_review(rows, out_dir)
+    return rows
+
+
+def approve(rows, construct_id: str, *, decision: str, reason: str = "",
+            notes: str = "") -> list:
+    """Record one decision in a review row list, in place, and return it.
+
+    Rejecting without a reason raises: the reason is what makes the screen
+    reportable as a funnel, and a blank one would leave a scene excluded for no
+    stated cause.
+    """
+    if decision not in (DECISION_APPROVED, DECISION_REJECTED):
+        raise ValueError(f"decision must be {DECISION_APPROVED!r} or "
+                         f"{DECISION_REJECTED!r}, got {decision!r}")
+    if decision == DECISION_REJECTED and reason not in REJECT_REASONS:
+        raise ValueError(f"a rejection needs a reason from {list(REJECT_REASONS)}, "
+                         f"got {reason!r}")
+    for row in rows:
+        if row["construct_id"] == construct_id:
+            row["decision"] = decision
+            row["reject_reason"] = reason if decision == DECISION_REJECTED else ""
+            row["notes"] = notes
+            return rows
+    raise KeyError(f"no review row for {construct_id!r}")
+
+
+def approved_ids(rows) -> set:
+    """Construct ids approved for the experiments."""
+    return {row["construct_id"] for row in rows
+            if row.get("decision") == DECISION_APPROVED}
+
+
+def approval_summary(rows, targets=None) -> dict:
+    """The screen's funnel: what was reviewed, approved, and rejected why.
+
+    Reported per configuration as well as overall. An approval rate that differs
+    between the arrangements would mean the arms of the decisive comparison were
+    screened to different standards, which is a threat to the comparison rather
+    than a detail, so it is not averaged away.
+    """
+    total = len(rows)
+    approved = [r for r in rows if r.get("decision") == DECISION_APPROVED]
+    rejected = [r for r in rows if r.get("decision") == DECISION_REJECTED]
+    reviewed = len(approved) + len(rejected)
+
+    by_configuration: dict = {}
+    for configuration in sorted({r.get("configuration", "") for r in rows}):
+        group = [r for r in rows if r.get("configuration") == configuration]
+        group_approved = [r for r in group
+                          if r.get("decision") == DECISION_APPROVED]
+        group_reviewed = [r for r in group
+                          if r.get("decision") in (DECISION_APPROVED,
+                                                   DECISION_REJECTED)]
+        entry = {
+            "scenes": len(group),
+            "reviewed": len(group_reviewed),
+            "approved": len(group_approved),
+            "unlabelled": len(group) - len(group_reviewed),
+            "approval_rate": (len(group_approved) / len(group_reviewed)
+                              if group_reviewed else float("nan")),
+        }
+        if targets:
+            goal = targets.get(configuration)
+            if goal is not None:
+                entry["target"] = goal
+                entry["still_needed"] = max(goal - len(group_approved), 0)
+        by_configuration[configuration] = entry
+
+    by_reason: dict = {}
+    for row in rejected:
+        reason = row.get("reject_reason") or REJECT_OTHER
+        by_reason[reason] = by_reason.get(reason, 0) + 1
+
+    by_cutout: dict = {}
+    for mode in sorted({r.get("auto_cutout_mode", "") for r in rows} - {""}):
+        group = [r for r in rows if r.get("auto_cutout_mode") == mode]
+        group_reviewed = [r for r in group
+                          if r.get("decision") in (DECISION_APPROVED,
+                                                   DECISION_REJECTED)]
+        by_cutout[mode] = {
+            "scenes": len(group),
+            "approval_rate": (
+                sum(1 for r in group_reviewed
+                    if r["decision"] == DECISION_APPROVED) / len(group_reviewed)
+                if group_reviewed else float("nan")),
+        }
+
+    return {
+        "scenes": total,
+        "reviewed": reviewed,
+        "approved": len(approved),
+        "rejected": len(rejected),
+        "unlabelled": total - reviewed,
+        "approval_rate": len(approved) / reviewed if reviewed else float("nan"),
+        "by_configuration": by_configuration,
+        "by_reject_reason": by_reason,
+        "by_cutout": by_cutout,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# The frozen experimental set
+# --------------------------------------------------------------------------- #
+# How many approved scenes each arrangement contributes. The same-side cells carry
+# the decisive comparison and are split evenly between the two sides, so a lateral
+# asymmetry in the model, or a systematic error in locating the start position,
+# appears as a difference between the two same-side cells instead of biasing their
+# pooled result. The opposite cell is the sum of the two, which is also what a base
+# frame yields: a frame supports one opposite arrangement and exactly one same-side
+# arrangement, on whichever side its object already sits.
+DEFAULT_TARGETS = {
+    CONFIG_OPPOSITE: 300,
+    CONFIG_SAME_LEFT: 150,
+    CONFIG_SAME_RIGHT: 150,
+}
+
+EVALUATION_NAME = "evaluation_set.csv"
+EVALUATION_FIELDS = ["construct_id", "base_scene_id", "configuration", "paired",
+                     "seed"]
+
+
+def select_evaluation_set(scenes, approved, *, targets=DEFAULT_TARGETS, seed: int = 0):
+    """Choose the experimental set from the approved scenes.
+
+    The same-side cells are filled first, because they are the binding constraint:
+    a base frame can only supply the same-side arrangement on the side its object
+    already occupies, so the scarcer side decides how many frames are needed. The
+    opposite cell is then taken from those same frames, which makes the same-side
+    against opposite contrast a within-frame comparison holding the background,
+    the object, the cutout, and the instruction fixed, and leaves scene identity
+    unable to explain a difference between the two.
+
+    Frames are drawn at random under `seed` from those whose scenes were approved,
+    so the rule stays mechanical and the set is reproducible. A cell that cannot be
+    filled is reported as a shortfall rather than quietly padded from unpaired
+    scenes, since replacing a paired scene with an unpaired one changes what the
+    comparison controls for.
+
+    Returns the chosen rows, the shortfall per cell, and the counts.
+    """
+    rng = np.random.default_rng(seed)
+    approved = set(approved)
+    rows = [asdict(s) if isinstance(s, ConstructedScene) else dict(s)
+            for s in scenes]
+    usable = [r for r in rows if r["construct_id"] in approved]
+
+    by_base: dict = {}
+    for row in usable:
+        by_base.setdefault(str(row["base_scene_id"]), {})[row["configuration"]] = row
+
+    same_side_configs = [c for c in (CONFIG_SAME_LEFT, CONFIG_SAME_RIGHT)
+                         if c in targets]
+    chosen: list[dict] = []
+    shortfall: dict = {}
+    selected_bases: list[str] = []
+
+    for configuration in same_side_configs:
+        # Sorted before the draw so the shuffle, and therefore the set, depends on
+        # the seed alone rather than on dictionary order.
+        eligible = sorted(base for base, built in by_base.items()
+                          if configuration in built and CONFIG_OPPOSITE in built)
+        goal = int(targets[configuration])
+        take = min(goal, len(eligible))
+        picked = [eligible[int(i)] for i in
+                  rng.choice(len(eligible), size=take, replace=False)] if take else []
+        shortfall[configuration] = goal - take
+        for base in picked:
+            chosen.append({**by_base[base][configuration], "paired": "yes"})
+            selected_bases.append(base)
+
+    opposite_goal = int(targets.get(CONFIG_OPPOSITE, 0))
+    paired_opposite = selected_bases[:opposite_goal]
+    for base in paired_opposite:
+        chosen.append({**by_base[base][CONFIG_OPPOSITE], "paired": "yes"})
+    shortfall[CONFIG_OPPOSITE] = opposite_goal - len(paired_opposite)
+
+    out_rows = [{
+        "construct_id": row["construct_id"],
+        "base_scene_id": row["base_scene_id"],
+        "configuration": row["configuration"],
+        "paired": row.get("paired", "yes"),
+        "seed": seed,
+    } for row in chosen]
+
+    counts: dict = {}
+    for row in out_rows:
+        counts[row["configuration"]] = counts.get(row["configuration"], 0) + 1
+    return {
+        "rows": out_rows,
+        "counts": counts,
+        "shortfall": {k: v for k, v in shortfall.items() if v > 0},
+        "approved_scenes": len(usable),
+        "paired_base_frames": len(set(selected_bases)),
+        "complete": not any(v > 0 for v in shortfall.values()),
+        "seed": seed,
+    }
+
+
+def write_evaluation_set(rows, out_dir: str) -> str:
+    """Freeze the experimental set to disk.
+
+    Written once and read by every later stage. Re-deriving the selection wherever
+    it is needed would let the set drift as approval continues, so the probe, the
+    analysis, and the figures would not be describing the same scenes.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, EVALUATION_NAME)
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=EVALUATION_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in EVALUATION_FIELDS})
+    os.replace(tmp, path)
+    print(f"[write_evaluation_set] froze {len(rows)} scenes -> {path}")
+    return path
+
+
+def load_evaluation_set(out_dir: str):
+    """Read the frozen experimental set, or an empty list when it does not exist."""
+    path = os.path.join(out_dir, EVALUATION_NAME)
+    if not os.path.isfile(path):
+        return []
+    with open(path, newline="") as f:
+        return [{col: row.get(col, "") for col in EVALUATION_FIELDS}
+                for row in csv.DictReader(f)]
+
+
+def evaluation_scenes(out_dir: str, scenes=None):
+    """The constructed manifest rows named by the frozen set, in its order.
+
+    The single entry point every later stage uses, so no stage decides for itself
+    what the experimental set is.
+    """
+    frozen = load_evaluation_set(out_dir)
+    if not frozen:
+        return []
+    rows = scenes if scenes is not None else load_constructed_manifest(out_dir)
+    by_id = {row["construct_id"]: row for row in rows}
+    paired = {row["construct_id"]: row.get("paired", "") for row in frozen}
+    out = []
+    for entry in frozen:
+        row = by_id.get(entry["construct_id"])
+        if row is not None:
+            out.append({**row, "paired": paired.get(entry["construct_id"], "")})
     return out
 
 

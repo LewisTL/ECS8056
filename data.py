@@ -10,10 +10,22 @@ Responsibilities:
     placement_relation scenes.
   * Classify instructions as multi-object / spatially-relational via a transparent
     text heuristic (the pilot filter for multi-object scene selection).
-  * Cache the surviving frames plus a manifest to Google Drive as a compact,
-    reproducible evaluation set.
+  * Harvest the frames into two disjoint roles, one supplying the base frames the
+    constructed experiments are built from and one reserved as the unaltered
+    validation set, and cache them plus a manifest to Google Drive.
   * Build antonym-swapped minimal pairs and queue scenes for iterative manual
     feasibility review.
+
+Two roles, one corpus. The experiments run on constructed scenes (see
+`compose_scenes.py`), which are composited from real Bridge frames, and the
+unaltered Bridge frames answer the separate question of whether a constructed-set
+finding transfers to data that was never edited. A frame that served as a
+construction base is not an independent test of that, so the harvest assigns each
+cached frame exactly one role and records it in `split`. The two roles have
+different admission rules: a validation trial needs an instruction that already
+yields a lateral minimal pair in a referent-selection reading, which is rare,
+while a construction base needs only a nameable object, which is almost every
+frame.
 
 Schema notes (confirmed against gs://gresearch/robotics/bridge/0.1.0/):
   * observation['image']                       uint8  (480, 640, 3)
@@ -28,6 +40,8 @@ Schema notes (confirmed against gs://gresearch/robotics/bridge/0.1.0/):
 from __future__ import annotations
 
 import csv
+import io
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -73,6 +87,27 @@ _WORD_RE = re.compile(r"[a-z]+")
 CATEGORY_REFERENT = "referent_selection"   # spatial term selects WHICH object
 CATEGORY_PLACEMENT = "placement_relation"  # spatial term is a DESTINATION
 CATEGORY_OTHER = "other"                    # no usable spatial term
+
+
+# --------------------------------------------------------------------------- #
+# Set roles
+# --------------------------------------------------------------------------- #
+# The role a cached frame plays. `construction` frames are the base frames the
+# constructed experiments are composited from; `validation` frames are held back
+# unaltered and carry the transfer question at the end of the analysis.
+#
+# The two are disjoint by construction rather than by convention. A frame that
+# was edited into an experimental stimulus cannot also be evidence that the
+# finding holds on unedited data, because the two measurements would share the
+# same scene, objects, and camera, and any scene-level idiosyncrasy would appear
+# in both. Assignment happens once, at harvest, and is recorded in the manifest
+# so nothing downstream has to re-derive it.
+SPLIT_CONSTRUCTION = "construction"
+SPLIT_VALIDATION = "validation"
+SPLIT_VALUES = (SPLIT_CONSTRUCTION, SPLIT_VALIDATION)
+# Frames cached before the roles existed carry no split and are claimed by
+# neither, so an older manifest cannot silently leak into either set.
+SPLIT_UNASSIGNED = ""
 
 
 @dataclass
@@ -174,6 +209,22 @@ def _flatten_action(world_vector, rotation_delta, open_gripper) -> np.ndarray:
     return vec
 
 
+def _as_array(value) -> np.ndarray:
+    """Materialise an observation image as an HxWx3 uint8 array.
+
+    Accepts an already-decoded tensor or array, or the encoded bytes returned
+    when the dataset is built with image decoding skipped. Skipping the decode
+    matters at harvest scale: an episode holds tens of frames and only one or two
+    are ever read, so decoding every frame in every episode dominates the cost of
+    streaming and buys nothing.
+    """
+    if hasattr(value, "numpy"):
+        value = value.numpy()
+    if isinstance(value, (bytes, bytearray)):
+        return np.asarray(Image.open(io.BytesIO(value)).convert("RGB"))
+    return np.asarray(value)
+
+
 def _gripper_open(step) -> bool:
     """Coerce a step's open_gripper action field to a plain bool.
 
@@ -217,6 +268,7 @@ def extract_episode(
     early_steps: int = 5,
     skip_first_noop: bool = True,
     post_grasp_steps: int = 5,
+    extract_grasp: bool = True,
 ) -> EpisodeRecord:
     """Pull the initial frame, instruction, early-motion ground truth, and the
     grasp-frame observation.
@@ -236,11 +288,16 @@ def extract_episode(
     determine. As with the early-motion vector, the gripper component is a
     state (recorded at the grasp step) rather than a sum. All three grasp
     fields are None when `grasp_index` returns None.
+
+    `extract_grasp=False` skips the grasp step entirely, so no second frame is
+    decoded and the three grasp fields are None. Placement scenes are the only
+    consumer of that frame, so a harvest that does not intend to analyse them
+    pays nothing for it.
     """
     steps = list(episode["steps"])
     first = steps[0]
 
-    image = first["observation"]["image"].numpy()
+    image = _as_array(first["observation"]["image"])
     instruction = first["observation"]["natural_language_instruction"].numpy().decode("utf-8")
 
     motion_steps = steps[1:] if (skip_first_noop and len(steps) > 1) else steps
@@ -258,12 +315,12 @@ def extract_episode(
     # sum over the early window.
     gt[IDX_GRIPPER] = float(bool(first["action"]["open_gripper"].numpy()))
 
-    grasp_frame_index = grasp_index(steps)
+    grasp_frame_index = grasp_index(steps) if extract_grasp else None
     grasp_image = None
     grasp_gt_vector = None
     if grasp_frame_index is not None:
         grasp_step = steps[grasp_frame_index]
-        grasp_image = grasp_step["observation"]["image"].numpy()
+        grasp_image = _as_array(grasp_step["observation"]["image"])
         post_steps = steps[grasp_frame_index + 1: grasp_frame_index + 1 + post_grasp_steps]
         ggt = np.zeros(7, dtype=np.float32)
         for step in post_steps:
@@ -290,11 +347,19 @@ def extract_episode(
 
 
 def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5,
-                     post_grasp_steps: int = 5):
+                     post_grasp_steps: int = 5, extract_grasp: bool = True,
+                     lazy_images: bool = True):
     """Yield EpisodeRecord objects from the GCS mirror, one episode at a time.
 
     Imported lazily so the TensorFlow/TFDS stack is only required when streaming,
     keeping this module importable in environments that hold only the model deps.
+
+    `lazy_images` asks the dataset not to decode the step images, leaving them as
+    encoded bytes that `_as_array` decodes only for the frames actually read. An
+    episode holds tens of frames and at most two are used, so this removes most of
+    the streaming cost, which matters once the harvest runs to thousands of
+    episodes. The request is dropped with a warning if the installed TFDS rejects
+    the decoder specification, since a slower stream is better than none.
     """
     # Importing TFDS pulls tensorflow-metadata, whose generated code is compiled
     # against a specific protobuf major version. Recent TensorFlow and
@@ -340,11 +405,22 @@ def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5,
 
     builder = builder_from_directory(BRIDGE_GCS)
     split = f"train[{split_start}:{split_start + n}]"
-    dataset = builder.as_dataset(split=split)
+    dataset = None
+    if lazy_images:
+        try:
+            decoders = {"steps": {"observation": {"image": tfds.decode.SkipDecoding()}}}
+            dataset = builder.as_dataset(split=split, decoders=decoders)
+        except Exception as exc:  # noqa: BLE001 - TFDS build-dependent
+            print(f"[stream_episodes] image decoding could not be skipped "
+                  f"({type(exc).__name__}); streaming with full decoding, which "
+                  f"is slower per episode")
+    if dataset is None:
+        dataset = builder.as_dataset(split=split)
     for offset, episode in enumerate(dataset):
         yield extract_episode(episode, episode_index=split_start + offset,
                               early_steps=early_steps,
-                              post_grasp_steps=post_grasp_steps)
+                              post_grasp_steps=post_grasp_steps,
+                              extract_grasp=extract_grasp)
 
 
 # --------------------------------------------------------------------------- #
@@ -487,7 +563,7 @@ DUPLICATE_SOURCE_MANUAL = "manual"
 
 MANIFEST_FIELDS = [
     "episode_index", "instruction", "category", "is_multi_object", "has_spatial",
-    "has_transfer", "matched_terms", "num_steps", "image_path",
+    "has_transfer", "matched_terms", "num_steps", "image_path", "split",
     "feasible_both", "feasibility_note",
     "duplicate_target", "duplicate_note", "duplicate_source", "duplicate_score",
     "gt_dx", "gt_dy", "gt_dz", "gt_rx", "gt_ry", "gt_rz", "gt_gripper",
@@ -497,71 +573,341 @@ MANIFEST_FIELDS = [
 ]
 
 
-def cache_records(records, out_dir: str, multi_object_only: bool = True) -> str:
-    """Write surviving frames as PNGs plus a manifest CSV under `out_dir`.
+def validation_eligible(instruction: str) -> bool:
+    """Whether an instruction can serve as an unaltered validation trial.
 
-    Only the filtered subset is persisted, keeping the cached evaluation set small
-    (tens of MB) and reproducible across sessions without re-streaming. Returns the
-    manifest path.
+    Three requirements, all on the wording, so the decision can be taken at
+    harvest before any frame is inspected. The instruction must yield exactly one
+    antonym swap, that swap must contrast the lateral axis so it is comparable
+    with the constructed experiments, and the term must select a referent rather
+    than name a destination, since at the initial frame a placement term
+    constrains nothing that the first action reveals.
+
+    Roughly one instruction in two hundred qualifies, which is why the validation
+    set is harvested across many more episodes than it keeps.
     """
-    frames_dir = os.path.join(out_dir, "frames")
-    os.makedirs(frames_dir, exist_ok=True)
-    manifest_path = os.path.join(out_dir, "manifest.csv")
+    made = make_pair(instruction)
+    if made is None:
+        return False
+    term, _ = made
+    if not is_lateral_term(term):
+        return False
+    return classify_instruction(instruction).category == CATEGORY_REFERENT
 
-    written = 0
-    with open(manifest_path, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
-        writer.writeheader()
-        for rec in records:
-            if multi_object_only and not rec.tags.is_multi_object:
+
+def manifest_row(record, *, split: str = SPLIT_UNASSIGNED,
+                 image_path: str = "", grasp_image_path: str = "") -> dict:
+    """Build one manifest row from an EpisodeRecord.
+
+    Shared by every caching path so a row cannot be assembled two ways. Review
+    and annotation fields are written at their defaults rather than left out,
+    because the manifest annotates rather than deletes and later passes fill them
+    in place.
+    """
+    gt = record.gt_vector
+    grasp_frame_index = ""
+    grasp_dx = grasp_dy = grasp_dz = ""
+    if record.grasp_frame_index is not None:
+        grasp_frame_index = record.grasp_frame_index
+        ggt = record.grasp_gt_vector
+        grasp_dx, grasp_dy, grasp_dz = ggt[0], ggt[1], ggt[2]
+    return {
+        "episode_index": record.episode_index,
+        "instruction": record.instruction,
+        "category": record.tags.category,
+        "is_multi_object": record.tags.is_multi_object,
+        "has_spatial": record.tags.has_spatial,
+        "has_transfer": record.tags.has_transfer,
+        "matched_terms": record.tags.matched,
+        "num_steps": record.num_steps,
+        "image_path": image_path,
+        "split": split,
+        # Feasibility is filled in later by manual review, not deleted.
+        "feasible_both": FEASIBLE_DEFAULT,
+        "feasibility_note": "",
+        # Duplicate-target is filled in later by the automated proposal pass and
+        # manual confirmation, not deleted.
+        "duplicate_target": DUPLICATE_DEFAULT,
+        "duplicate_note": "",
+        "duplicate_source": "",
+        "duplicate_score": "",
+        "gt_dx": gt[0], "gt_dy": gt[1], "gt_dz": gt[2],
+        "gt_rx": gt[3], "gt_ry": gt[4], "gt_rz": gt[5],
+        "gt_gripper": gt[6],
+        "grasp_frame_index": grasp_frame_index,
+        "grasp_image_path": grasp_image_path,
+        "grasp_gt_dx": grasp_dx, "grasp_gt_dy": grasp_dy, "grasp_gt_dz": grasp_dz,
+        "category_manual": "",
+        "category_source": CATEGORY_SOURCE_HEURISTIC,
+    }
+
+
+def append_manifest_rows(out_dir: str, rows) -> str:
+    """Append rows to the manifest, creating or widening the header as needed.
+
+    Appending under an assumed set of column names is the failure that corrupted
+    the prediction log: a writer given more fields than the header declares emits
+    the row without complaint, and the file is unreadable from that point on while
+    nothing reports an error. The header is therefore read first, and a file whose
+    header does not already cover every column being written is rewritten under the
+    union before anything is appended. Columns the file carries and the current
+    schema does not are preserved rather than dropped, since a manifest may hold
+    annotations added by a later pass.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, "manifest.csv")
+    rows = list(rows)
+    if not rows:
+        return path
+
+    fields = list(MANIFEST_FIELDS)
+    existing_header = None
+    if os.path.isfile(path):
+        with open(path, newline="") as f:
+            existing_header = next(csv.reader(f), None)
+    if existing_header:
+        fields = list(MANIFEST_FIELDS) + [c for c in existing_header
+                                          if c not in MANIFEST_FIELDS]
+        if existing_header != fields:
+            with open(path, newline="") as f:
+                current = [dict(r) for r in csv.DictReader(f)]
+            tmp = path + ".tmp"
+            with open(tmp, "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+                for row in current:
+                    writer.writerow({k: row.get(k, "") for k in fields})
+            os.replace(tmp, path)
+    else:
+        with open(path, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=fields).writeheader()
+
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
+    return path
+
+
+# --------------------------------------------------------------------------- #
+# Harvest
+# --------------------------------------------------------------------------- #
+# Streaming is sequential and the validation criteria are rare, so a harvest that
+# reaches a useful validation count runs for thousands of episodes and across more
+# than one session. The position reached is therefore recorded next to the frames:
+# the manifest cannot supply it, because episodes that were streamed and cached by
+# neither role leave no row, so the last cached index understates how far the
+# stream got and a resumed run would re-stream what it already rejected.
+HARVEST_STATE_NAME = "harvest_state.json"
+
+# Rows are appended in batches, since the cache lives on a network-mounted Drive
+# where a write per frame is slow. The batch is small enough that an interrupted
+# session loses seconds of work.
+HARVEST_FLUSH_EVERY = 25
+
+
+def read_harvest_state(out_dir: str) -> dict:
+    """Read the recorded harvest position, or an empty state."""
+    path = os.path.join(out_dir, HARVEST_STATE_NAME)
+    if not os.path.isfile(path):
+        return {"episodes_streamed": 0, "next_split_start": 0}
+    try:
+        with open(path) as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return {"episodes_streamed": 0, "next_split_start": 0}
+    state.setdefault("episodes_streamed", 0)
+    state.setdefault("next_split_start", 0)
+    return state
+
+
+def write_harvest_state(out_dir: str, state: dict) -> str:
+    """Record the harvest position, replacing the file atomically."""
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, HARVEST_STATE_NAME)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(state, f, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+    return path
+
+
+def split_counts(rows) -> dict:
+    """Count manifest rows by split."""
+    counts: dict[str, int] = {}
+    for row in rows:
+        key = row.get("split", SPLIT_UNASSIGNED) or SPLIT_UNASSIGNED
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def harvest_records(
+    records,
+    out_dir: str,
+    *,
+    validation_target: int | None,
+    construction_target: int | None,
+    cache_grasp: bool = False,
+    flush_every: int = HARVEST_FLUSH_EVERY,
+    verbose: bool = True,
+) -> dict:
+    """Cache streamed episodes into the two roles, appending and resumable.
+
+    Every frame whose instruction satisfies `validation_eligible` is cached as
+    validation and is never offered to construction, whatever the validation
+    target. Holding the rule rather than the count fixed is what keeps the roles
+    disjoint under a later decision to enlarge the validation set: if eligible
+    frames spilled into construction once the target was met, growing the
+    validation set afterwards would mean either re-streaming or admitting frames
+    that had already been edited into stimuli.     Remaining frames become
+    construction bases until `construction_target` is reached, after which
+    streaming continues for validation alone.
+
+    `validation_target` and `construction_target` decide when to stop, not what to
+    admit. `None` for either means unbounded. No language filter is applied to the
+    construction pool: a constructed trial writes its own instruction over the
+    episode's manipulated object, so requiring the source wording to carry a
+    spatial or transfer structure would discard usable frames for a property the
+    stimulus does not inherit.
+
+    Frames already in the manifest are skipped, so a re-run resumes rather than
+    duplicating, and rows are appended in batches with the stream position
+    recorded alongside so an interrupted session loses only the current batch.
+    """
+    os.makedirs(os.path.join(out_dir, "frames"), exist_ok=True)
+
+    existing = load_manifest(out_dir) if os.path.isfile(
+        os.path.join(out_dir, "manifest.csv")) else []
+    seen = {str(row["episode_index"]) for row in existing}
+    counts = split_counts(existing)
+    validation = counts.get(SPLIT_VALIDATION, 0)
+    construction = counts.get(SPLIT_CONSTRUCTION, 0)
+    state = read_harvest_state(out_dir)
+
+    summary = {
+        "streamed": 0,
+        "skipped_existing": 0,
+        "cached": {SPLIT_VALIDATION: 0, SPLIT_CONSTRUCTION: 0},
+        "totals": {SPLIT_VALIDATION: validation, SPLIT_CONSTRUCTION: construction},
+        "manifest_path": os.path.join(out_dir, "manifest.csv"),
+    }
+
+    def targets_met() -> bool:
+        val_done = validation_target is not None and validation >= validation_target
+        con_done = (construction_target is not None
+                    and construction >= construction_target)
+        return val_done and con_done
+
+    pending: list[dict] = []
+
+    def flush() -> None:
+        if pending:
+            append_manifest_rows(out_dir, pending)
+            pending.clear()
+        write_harvest_state(out_dir, state)
+
+    if targets_met():
+        if verbose:
+            print(f"[harvest_records] targets already met: "
+                  f"{validation} validation, {construction} construction")
+        return summary
+
+    for record in records:
+        summary["streamed"] += 1
+        state["next_split_start"] = int(record.episode_index) + 1
+        state["episodes_streamed"] = state.get("episodes_streamed", 0) + 1
+
+        if str(record.episode_index) in seen:
+            summary["skipped_existing"] += 1
+            continue
+
+        if validation_eligible(record.instruction):
+            split = SPLIT_VALIDATION
+        else:
+            if construction_target is not None and construction >= construction_target:
                 continue
-            rel = os.path.join("frames", f"ep_{rec.episode_index:06d}.png")
-            Image.fromarray(rec.image).save(os.path.join(out_dir, rel))
-            gt = rec.gt_vector
+            split = SPLIT_CONSTRUCTION
 
-            # Grasp fields stay empty when no grasp was detected, matching the
-            # existing convention for unfilled manual-review columns.
-            grasp_frame_index = ""
-            grasp_rel = ""
-            grasp_dx = grasp_dy = grasp_dz = ""
-            if rec.grasp_frame_index is not None:
-                grasp_frame_index = rec.grasp_frame_index
-                grasp_rel = os.path.join("frames", f"ep_{rec.episode_index:06d}_grasp.png")
-                Image.fromarray(rec.grasp_image).save(os.path.join(out_dir, grasp_rel))
-                ggt = rec.grasp_gt_vector
-                grasp_dx, grasp_dy, grasp_dz = ggt[0], ggt[1], ggt[2]
+        rel = os.path.join("frames", f"ep_{int(record.episode_index):06d}.png")
+        Image.fromarray(record.image).save(os.path.join(out_dir, rel))
+        grasp_rel = ""
+        if cache_grasp and record.grasp_image is not None:
+            grasp_rel = os.path.join(
+                "frames", f"ep_{int(record.episode_index):06d}_grasp.png")
+            Image.fromarray(record.grasp_image).save(os.path.join(out_dir, grasp_rel))
 
-            writer.writerow({
-                "episode_index": rec.episode_index,
-                "instruction": rec.instruction,
-                "category": rec.tags.category,
-                "is_multi_object": rec.tags.is_multi_object,
-                "has_spatial": rec.tags.has_spatial,
-                "has_transfer": rec.tags.has_transfer,
-                "matched_terms": rec.tags.matched,
-                "num_steps": rec.num_steps,
-                "image_path": rel,
-                # Feasibility is filled in later by manual review, not deleted.
-                "feasible_both": FEASIBLE_DEFAULT,
-                "feasibility_note": "",
-                # Duplicate-target is filled in later by the automated proposal
-                # pass and manual confirmation, not deleted.
-                "duplicate_target": DUPLICATE_DEFAULT,
-                "duplicate_note": "",
-                "duplicate_source": "",
-                "duplicate_score": "",
-                "gt_dx": gt[0], "gt_dy": gt[1], "gt_dz": gt[2],
-                "gt_rx": gt[3], "gt_ry": gt[4], "gt_rz": gt[5],
-                "gt_gripper": gt[6],
-                "grasp_frame_index": grasp_frame_index,
-                "grasp_image_path": grasp_rel,
-                "grasp_gt_dx": grasp_dx, "grasp_gt_dy": grasp_dy, "grasp_gt_dz": grasp_dz,
-                "category_manual": "",
-                "category_source": CATEGORY_SOURCE_HEURISTIC,
-            })
-            written += 1
-    print(f"[cache_records] wrote {written} frames + manifest to {out_dir}")
-    return manifest_path
+        pending.append(manifest_row(record, split=split, image_path=rel,
+                                    grasp_image_path=grasp_rel))
+        seen.add(str(record.episode_index))
+        if split == SPLIT_VALIDATION:
+            validation += 1
+        else:
+            construction += 1
+        summary["cached"][split] += 1
+
+        if len(pending) >= flush_every:
+            flush()
+            if verbose:
+                print(f"[harvest_records] {summary['streamed']} streamed, "
+                      f"{validation} validation, {construction} construction")
+        if targets_met():
+            break
+
+    flush()
+    summary["totals"] = {SPLIT_VALIDATION: validation,
+                         SPLIT_CONSTRUCTION: construction}
+    summary["next_split_start"] = state["next_split_start"]
+    summary["targets_met"] = targets_met()
+    if verbose:
+        print(f"[harvest_records] streamed {summary['streamed']} episodes, cached "
+              f"{summary['cached'][SPLIT_VALIDATION]} validation and "
+              f"{summary['cached'][SPLIT_CONSTRUCTION]} construction")
+        print(f"[harvest_records] totals: {summary['totals']}, next split_start "
+              f"{summary['next_split_start']}, targets met "
+              f"{summary['targets_met']}")
+    return summary
+
+
+# Harvest sizing. The validation set is scarce by nature, so its target is a
+# count and the episode budget follows from it rather than the reverse. The
+# construction target is the pool the constructed experiments are drawn from: only
+# a fraction of base frames survive detection, surface location, and placement, so
+# the pool has to exceed the number of experimental scenes wanted by several times.
+DEFAULT_VALIDATION_TARGET = 50
+DEFAULT_CONSTRUCTION_TARGET = 2500
+
+
+def harvest(
+    out_dir: str,
+    *,
+    episodes: int,
+    split_start: int | None = None,
+    validation_target: int = DEFAULT_VALIDATION_TARGET,
+    construction_target: int | None = DEFAULT_CONSTRUCTION_TARGET,
+    cache_grasp: bool = False,
+    early_steps: int = 5,
+    post_grasp_steps: int = 5,
+    verbose: bool = True,
+) -> dict:
+    """Stream up to `episodes` episodes and cache them into the two roles.
+
+    `split_start` defaults to the position recorded by the previous run, so
+    repeated calls walk forward through the corpus instead of re-streaming what
+    was already rejected. Returns the `harvest_records` summary.
+    """
+    if split_start is None:
+        split_start = read_harvest_state(out_dir).get("next_split_start", 0)
+    if verbose:
+        print(f"[harvest] streaming train[{split_start}:{split_start + episodes}] "
+              f"-> {out_dir}")
+    records = stream_episodes(n=episodes, split_start=split_start,
+                              early_steps=early_steps,
+                              post_grasp_steps=post_grasp_steps,
+                              extract_grasp=cache_grasp)
+    return harvest_records(records, out_dir,
+                           validation_target=validation_target,
+                           construction_target=construction_target,
+                           cache_grasp=cache_grasp, verbose=verbose)
 
 
 def load_manifest(out_dir: str):
@@ -673,6 +1019,7 @@ def _review_item(row: dict) -> dict:
         pairable = True
     return {
         "episode_index": row["episode_index"],
+        "split": row.get("split", SPLIT_UNASSIGNED) or SPLIT_UNASSIGNED,
         "category": _effective_category(row),
         "instruction": instruction,
         "instr_b": instr_b,
@@ -690,10 +1037,19 @@ def _review_item(row: dict) -> dict:
     }
 
 
-def review_summary(out_dir: str) -> dict:
+def review_summary(out_dir: str, *, splits=(SPLIT_VALIDATION,)) -> dict:
     """Summarise feasibility review progress for a cached manifest.
 
+    Review qualifies the unaltered validation trials, so the progress counters
+    cover the validation split by default. Construction frames are not reviewed
+    for feasibility: the constructed scene writes its own instruction and its
+    arrangement is chosen rather than found, so feasibility is a property of the
+    stimulus that construction guarantees, and the constructed set has its own
+    approval pass in `compose_scenes.py`. Pass `splits=None` to count every row.
+
     Returns a dict with:
+      * `by_split`: {split: count} over the whole manifest, unfiltered
+      * `reviewed_scope`: the splits the counters below cover
       * `by_category_feasibility`: {(category, feasible_both): count}
       * `pairable`: count of scenes with a valid antonym pair
       * `non_pairable`: count of scenes without a valid antonym pair
@@ -710,7 +1066,12 @@ def review_summary(out_dir: str) -> dict:
       * `primary_eligible`: pairable referent_selection scenes that satisfy the
         headline stratum (feasible_both == 'yes' and duplicate_target == 'yes')
     """
-    rows = load_manifest(out_dir)
+    all_rows = load_manifest(out_dir)
+    by_split = split_counts(all_rows)
+    allowed = set(splits) if splits is not None else None
+    rows = [r for r in all_rows
+            if allowed is None
+            or (r.get("split", SPLIT_UNASSIGNED) or SPLIT_UNASSIGNED) in allowed]
     by_cat_feas: dict[tuple[str, str], int] = {}
     pairable = 0
     non_pairable = 0
@@ -746,6 +1107,8 @@ def review_summary(out_dir: str) -> dict:
         else:
             non_pairable += 1
     return {
+        "by_split": by_split,
+        "reviewed_scope": tuple(sorted(allowed)) if allowed is not None else "all",
         "by_category_feasibility": by_cat_feas,
         "pairable": pairable,
         "non_pairable": non_pairable,
@@ -756,7 +1119,8 @@ def review_summary(out_dir: str) -> dict:
         "referent_pairable_dup_unclear": referent_dup_unclear,
         "duplicate_source": dup_source,
         "primary_eligible": primary_eligible,
-        "total": len(rows),
+        "in_scope": len(rows),
+        "total": len(all_rows),
     }
 
 
@@ -767,9 +1131,16 @@ def review_queue(
     duplicate_status: str | None = None,
     categories: list[str] | None = None,
     only_pairable: bool = True,
+    splits=(SPLIT_VALIDATION,),
     limit: int | None = None,
 ) -> list[dict]:
     """Return an ordered list of scenes for manual review.
+
+    Scoped to the validation split by default, because that is the set this review
+    qualifies: the constructed experiments carry their own approval pass, and a
+    frame reserved as a construction base is never shown as a validation trial.
+    Frames cached before the roles existed carry no split and are therefore in
+    neither scope; pass `splits=None` to review them.
 
     Priority order:
       1. referent_selection, pairable, matching status
@@ -787,6 +1158,7 @@ def review_queue(
             pass flagged as borderline, so human effort confirms only those.
         categories: optional allow-list of effective categories; None keeps all.
         only_pairable: when True, drop scenes that do not form a minimal pair.
+        splits: allow-list of manifest splits; None keeps every split.
         limit: optional maximum number of items to return.
     """
     if status is not None and status not in FEASIBLE_VALUES:
@@ -802,6 +1174,9 @@ def review_queue(
     cat_allow = set(categories) if categories is not None else None
 
     items = [_review_item(row) for row in load_manifest(out_dir)]
+    if splits is not None:
+        allowed = set(splits)
+        items = [it for it in items if it["split"] in allowed]
     if status is not None:
         items = [it for it in items if it["feasible_both"] == status]
     if duplicate_status is not None:

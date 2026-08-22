@@ -31,8 +31,9 @@ Grasp-frame placement pairs (post-grasp observation). Use `--frame` (singular);
     --frames-root ~/bridge_frames --frame grasp --pair-id ep000000
 ```
 
---frames-root points at the cached BridgeData frames (copy once with e.g.
-`rclone copy gdrive:openvla_cache/bridge_multiobj/frames ~/bridge_frames`).
+--frames-root points at the cached frames (copy once with e.g.
+`rclone copy gdrive:openvla_cache/v2/bridge/frames ~/bridge_frames`, or
+`gdrive:openvla_cache/v2/constructed/frames` for the constructed stimuli).
 Pairs whose image can't be found still render, without the photo.
 
 Scale caveat: OpenVLA returns one 7-DoF action per instruction, not a full
@@ -172,9 +173,9 @@ if not pairs:
         msg.append(f"  ... and {len(all_pairs) - 40} more")
     if args.frame and "grasp" in args.frame and frame_counts.get("grasp", 0) == 0:
         msg.append(
-            "[rollout] this pairs.json has no grasp-frame records. Re-export "
-            "from Notebook 04 using probe_predictions_v3.csv (two-frame probe), "
-            "then copy the new pairs.json to the rendering instance. "
+            "[rollout] this pairs.json has no grasp-frame records. Grasp frames "
+            "belong to placement scenes, which the current harvest does not cache; "
+            "re-export from Notebook 04 against a log that contains them. "
             "Also use --frame grasp (singular), not --frames.")
     if filtered:
         msg.append("[rollout] re-run with --list, or pass a pair_id / scene_id / "
