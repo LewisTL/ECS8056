@@ -16,7 +16,7 @@ inspection of every scene:
   3. Map the detection scores to a proposal (`yes` / `no` / `unclear`) with a
      transparent decision function. High-confidence proposals are accepted
      automatically; borderline cases are marked `unclear` and left for manual
-     confirmation in the scene-review notebook.
+     confirmation in the validation set review notebook.
 
 Heavy dependencies (torch, transformers, and optionally spaCy) are imported
 lazily inside the functions that need them, so the module stays importable in

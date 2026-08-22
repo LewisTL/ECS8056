@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import os
 
+import numpy as np
 import pytest
 
 from data import (
@@ -20,13 +21,25 @@ from data import (
     DUPLICATE_SOURCE_MANUAL,
     FEASIBLE_DEFAULT,
     MANIFEST_FIELDS,
+    PROTOBUF_SPEC,
+    SPLIT_CONSTRUCTION,
+    SPLIT_UNASSIGNED,
+    SPLIT_VALIDATION,
     _categorise,
+    append_manifest_rows,
     classify_instruction,
     grasp_index,
+    harvest_records,
+    load_manifest,
     make_pair,
+    protobuf_runtime_problem,
+    read_harvest_state,
+    release_components,
     review_queue,
     review_summary,
+    split_counts,
     update_manifest_annotations,
+    validation_eligible,
 )
 from detect_duplicates import (classify_counts, clip_box,
                                extract_manipulated_noun, extract_target_noun,
@@ -106,7 +119,11 @@ def test_make_pair_phrase_priority_over_token():
 
 
 def _write_manifest(tmp_path, rows: list[dict]) -> str:
-    """Write a minimal manifest.csv under tmp_path and return the directory."""
+    """Write a minimal manifest.csv under tmp_path and return the directory.
+
+    Rows default to the validation split, since that is the scope manual review
+    covers; a test exercising the split filter sets the field explicitly.
+    """
     out_dir = str(tmp_path)
     path = os.path.join(out_dir, "manifest.csv")
     normalised = []
@@ -117,6 +134,10 @@ def _write_manifest(tmp_path, rows: list[dict]) -> str:
             full["feasible_both"] = FEASIBLE_DEFAULT
         if not full["category_source"]:
             full["category_source"] = CATEGORY_SOURCE_HEURISTIC
+        # Absent means "the usual case"; an explicit empty string means a frame
+        # cached before the roles existed, which the split filter must exclude.
+        if "split" not in row:
+            full["split"] = SPLIT_VALIDATION
         normalised.append(full)
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
@@ -294,6 +315,207 @@ def test_update_manifest_annotations_writes_duplicate_source(tmp_path):
     assert items[2]["duplicate_source"] == DUPLICATE_SOURCE_MANUAL
 
 
+# --------------------------------------------------------------------------- #
+# Set roles and the harvest
+# --------------------------------------------------------------------------- #
+def test_validation_eligible_requires_lateral_referent_pair():
+    # A lateral term selecting a referent: usable unaltered.
+    assert validation_eligible("pick up the cup on the left")
+    assert validation_eligible("take the leftmost fork")
+    # A destination phrase: the term names where the object goes, and the first
+    # action is the same reach either way.
+    assert not validation_eligible("move the pot to the right of the spoon")
+    # A non-lateral swap is not comparable with the constructed experiments.
+    assert not validation_eligible("put the spoon in front of the bowl")
+    # No swappable term at all.
+    assert not validation_eligible("put the corn in the pot")
+    # Two swappable terms would not be a minimal pair.
+    assert not validation_eligible("move the left cup to the right")
+
+
+class _FakeTags:
+    def __init__(self, instruction):
+        tags = classify_instruction(instruction)
+        self.category = tags.category
+        self.spatial_tokens = tags.spatial_tokens
+        self.spatial_phrases = tags.spatial_phrases
+        self.has_transfer = tags.has_transfer
+        self.has_spatial = tags.has_spatial
+        self.is_multi_object = tags.is_multi_object
+        self.matched = tags.matched
+
+
+class _FakeRecord:
+    """The subset of EpisodeRecord the harvest reads, without TFDS or a stream."""
+
+    def __init__(self, episode_index: int, instruction: str):
+        self.episode_index = episode_index
+        self.instruction = instruction
+        self.image = np.zeros((4, 6, 3), dtype=np.uint8)
+        self.gt_vector = np.zeros(7, dtype=np.float32)
+        self.num_steps = 12
+        self.tags = _FakeTags(instruction)
+        self.grasp_frame_index = None
+        self.grasp_image = None
+        self.grasp_gt_vector = None
+
+
+def _records(specs):
+    return [_FakeRecord(index, instruction) for index, instruction in specs]
+
+
+def test_harvest_assigns_disjoint_roles(tmp_path):
+    out_dir = str(tmp_path)
+    summary = harvest_records(
+        _records([
+            (0, "pick up the cup on the left"),      # validation eligible
+            (1, "put the corn in the pot"),          # construction base
+            (2, "move the pot to the right of the spoon"),  # construction base
+            (3, "take the leftmost fork"),           # validation eligible
+        ]),
+        out_dir, validation_target=None, construction_target=None, verbose=False,
+    )
+    rows = {int(r["episode_index"]): r for r in load_manifest(out_dir)}
+    assert rows[0]["split"] == SPLIT_VALIDATION
+    assert rows[3]["split"] == SPLIT_VALIDATION
+    assert rows[1]["split"] == SPLIT_CONSTRUCTION
+    assert rows[2]["split"] == SPLIT_CONSTRUCTION
+    assert summary["totals"] == {SPLIT_VALIDATION: 2, SPLIT_CONSTRUCTION: 2}
+    # Every cached frame carries exactly one role, so no frame can serve both.
+    assert not (set(r["episode_index"] for r in load_manifest(out_dir)
+                    if r["split"] == SPLIT_VALIDATION)
+                & set(r["episode_index"] for r in load_manifest(out_dir)
+                      if r["split"] == SPLIT_CONSTRUCTION))
+
+
+def test_harvest_keeps_eligible_frames_out_of_the_construction_pool(tmp_path):
+    """A frame that could be a validation trial is never used as a base frame.
+
+    Otherwise enlarging the validation set later would mean either re-streaming or
+    admitting frames that had already been composited into stimuli.
+    """
+    out_dir = str(tmp_path)
+    harvest_records(
+        _records([(0, "pick up the cup on the left"),
+                  (1, "pick up the mug on the right"),
+                  (2, "put the corn in the pot")]),
+        out_dir, validation_target=1, construction_target=None, verbose=False,
+    )
+    rows = {int(r["episode_index"]): r["split"] for r in load_manifest(out_dir)}
+    # The second eligible frame arrives after the validation target is met and is
+    # still cached as validation rather than falling through to construction.
+    assert rows[1] == SPLIT_VALIDATION
+
+
+def test_harvest_stops_once_both_targets_are_met(tmp_path):
+    out_dir = str(tmp_path)
+    summary = harvest_records(
+        _records([(0, "pick up the cup on the left"),
+                  (1, "put the corn in the pot"),
+                  (2, "put the fork on the plate"),
+                  (3, "put the knife on the board")]),
+        out_dir, validation_target=1, construction_target=1, verbose=False,
+    )
+    assert summary["targets_met"]
+    assert summary["streamed"] == 2
+    assert summary["next_split_start"] == 2
+
+
+def test_harvest_resumes_without_duplicating(tmp_path):
+    out_dir = str(tmp_path)
+    first = _records([(0, "pick up the cup on the left"),
+                      (1, "put the corn in the pot")])
+    harvest_records(first, out_dir, validation_target=None,
+                    construction_target=None, verbose=False)
+    # A resumed session re-offers what it already cached plus something new.
+    summary = harvest_records(
+        first + _records([(2, "put the fork on the plate")]),
+        out_dir, validation_target=None, construction_target=None, verbose=False,
+    )
+    indices = [int(r["episode_index"]) for r in load_manifest(out_dir)]
+    assert sorted(indices) == [0, 1, 2]
+    assert len(indices) == 3
+    assert summary["skipped_existing"] == 2
+    assert read_harvest_state(out_dir)["next_split_start"] == 3
+
+
+def test_harvest_state_records_the_stream_position_past_uncached_episodes(tmp_path):
+    """The manifest cannot supply the resume point on its own.
+
+    Once the construction target is met, later episodes are streamed and cached by
+    neither role, so the highest cached index understates how far the stream got and
+    a resumed run would re-stream what it already rejected.
+    """
+    out_dir = str(tmp_path)
+    harvest_records(
+        _records([(0, "put the corn in the pot"),
+                  (1, "put the fork on the plate"),
+                  (2, "put the knife on the board")]),
+        out_dir, validation_target=None, construction_target=1, verbose=False,
+    )
+    cached = [int(r["episode_index"]) for r in load_manifest(out_dir)]
+    assert cached == [0]
+    assert read_harvest_state(out_dir)["next_split_start"] == 3
+
+
+def test_append_manifest_rows_widens_a_narrow_header(tmp_path):
+    """Appending under an assumed header is what corrupted the prediction log.
+
+    A file whose header does not cover every column being written is rewritten
+    under the union first, so the rows stay readable by name.
+    """
+    out_dir = str(tmp_path)
+    path = os.path.join(out_dir, "manifest.csv")
+    with open(path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=["episode_index", "instruction"])
+        writer.writeheader()
+        writer.writerow({"episode_index": "7", "instruction": "old row"})
+    append_manifest_rows(out_dir, [{"episode_index": "8", "instruction": "new row",
+                                    "split": SPLIT_CONSTRUCTION}])
+    rows = {int(r["episode_index"]): r for r in load_manifest(out_dir)}
+    assert rows[7]["instruction"] == "old row"
+    assert rows[7]["split"] == SPLIT_UNASSIGNED
+    assert rows[8]["split"] == SPLIT_CONSTRUCTION
+
+
+def test_review_queue_scopes_to_the_validation_split(tmp_path):
+    out_dir = _write_manifest(tmp_path, [
+        {"episode_index": "1", "instruction": "pick up the cup on the left",
+         "category": CATEGORY_REFERENT, "split": SPLIT_VALIDATION},
+        {"episode_index": "2", "instruction": "pick up the mug on the left",
+         "category": CATEGORY_REFERENT, "split": SPLIT_CONSTRUCTION},
+        {"episode_index": "3", "instruction": "pick up the pan on the left",
+         "category": CATEGORY_REFERENT, "split": SPLIT_UNASSIGNED},
+    ])
+    assert [it["episode_index"] for it in review_queue(out_dir)] == ["1"]
+    # Construction frames are not reviewed as validation trials, and a frame
+    # cached before the roles existed belongs to neither scope.
+    assert len(review_queue(out_dir, splits=None)) == 3
+    assert len(review_queue(out_dir, splits=(SPLIT_CONSTRUCTION,))) == 1
+
+
+def test_review_summary_reports_splits_and_scopes_its_counters(tmp_path):
+    out_dir = _write_manifest(tmp_path, [
+        {"episode_index": "1", "instruction": "pick up the cup on the left",
+         "category": CATEGORY_REFERENT, "feasible_both": "yes",
+         "duplicate_target": "yes", "split": SPLIT_VALIDATION},
+        {"episode_index": "2", "instruction": "pick up the mug on the left",
+         "category": CATEGORY_REFERENT, "feasible_both": "yes",
+         "duplicate_target": "yes", "split": SPLIT_CONSTRUCTION},
+    ])
+    summary = review_summary(out_dir)
+    assert summary["by_split"] == {SPLIT_VALIDATION: 1, SPLIT_CONSTRUCTION: 1}
+    assert summary["total"] == 2
+    assert summary["in_scope"] == 1
+    assert summary["primary_eligible"] == 1
+    assert review_summary(out_dir, splits=None)["primary_eligible"] == 2
+
+
+def test_split_counts_treats_a_missing_split_as_unassigned():
+    assert split_counts([{"split": SPLIT_VALIDATION}, {}, {"split": ""}]) == {
+        SPLIT_VALIDATION: 1, SPLIT_UNASSIGNED: 2}
+
+
 def test_classify_counts_bands():
     # Two confident detections above the high threshold -> duplicate.
     label, conf = classify_counts([0.9, 0.8, 0.2], high=0.3, low=0.15)
@@ -376,3 +598,36 @@ def test_clip_box_orders_corners_and_keeps_boxes_inside_the_frame():
     assert clip_box((-5, -5, 150, 150), 100, 80) == (0.0, 0.0, 100.0, 80.0)
     # Reversed corners are normalised rather than producing a negative extent.
     assert clip_box((60, 70, 20, 30), 100, 100) == (20.0, 30.0, 60.0, 70.0)
+
+
+def test_release_components_ignores_suffixes():
+    assert release_components("6.31.1") == (6, 31, 1)
+    assert release_components("7.36.0") == (7, 36, 0)
+    assert release_components("6.32.0rc1") == (6, 32, 0)
+    assert release_components("unknown") == ()
+
+
+def test_protobuf_runtime_accepts_the_supported_window():
+    assert protobuf_runtime_problem("6.31.1") is None
+    assert protobuf_runtime_problem("6.33.6") is None
+
+
+def test_protobuf_runtime_rejects_a_runtime_below_the_generated_code():
+    problem = protobuf_runtime_problem("5.29.6")
+    assert problem is not None
+    assert PROTOBUF_SPEC in problem
+    assert "older" in problem
+
+
+def test_protobuf_runtime_rejects_a_runtime_past_the_tfds_upper_bound():
+    """Protobuf 7 removed the descriptor attribute released TFDS reads."""
+    problem = protobuf_runtime_problem("7.36.0")
+    assert problem is not None
+    assert PROTOBUF_SPEC in problem
+    assert "FieldDescriptor.label" in problem
+
+
+def test_protobuf_runtime_defers_on_an_unparseable_version():
+    """An unrecognised version string must not block streaming by itself."""
+    assert protobuf_runtime_problem("") is None
+    assert protobuf_runtime_problem("unknown") is None

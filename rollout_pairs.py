@@ -175,7 +175,7 @@ if not pairs:
         msg.append(
             "[rollout] this pairs.json has no grasp-frame records. Grasp frames "
             "belong to placement scenes, which the current harvest does not cache; "
-            "re-export from Notebook 04 against a log that contains them. "
+            "re-export from Notebook 06 against a log that contains them. "
             "Also use --frame grasp (singular), not --frames.")
     if filtered:
         msg.append("[rollout] re-run with --list, or pass a pair_id / scene_id / "

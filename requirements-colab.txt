@@ -1,8 +1,16 @@
 # OpenVLA inference-only requirements for Google Colab.
 #
+# IMPORTANT: requires Python 3.12. Pin the Colab runtime version to 2026.07
+# (Runtime > Change runtime type > Runtime version). tokenizers 0.19.1 publishes no
+# wheel beyond CPython 3.12 and cannot be built in the runtime, so on a Python 3.13
+# runtime the install fails and the session keeps the pre-installed transformers,
+# whose 5.x releases no longer expose AutoModelForVision2Seq. Install with
+# --only-binary=:all: so a missing wheel stops the install rather than falling back
+# to a source build.
+#
 # IMPORTANT: do NOT reinstall torch on Colab. Colab ships a torch build that is
-# matched to its CUDA driver; overriding it tends to break GPU support. We pin
-# only the libraries that govern OpenVLA model loading, plus quantisation deps.
+# matched to its CUDA driver; overriding it tends to break GPU support. Only the
+# libraries that govern OpenVLA model loading are pinned, plus quantisation deps.
 #
 # The trio below is the OpenVLA authors' known-good set. Newer transformers/timm/
 # tokenizers cause the misleading "requires ... prismatic" load error.
