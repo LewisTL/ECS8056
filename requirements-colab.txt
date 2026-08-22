@@ -27,7 +27,11 @@ accelerate==0.30.1
 bitsandbytes>=0.45.0
 
 # Required by the Llama/SentencePiece tokenizer conversion under transformers 4.40.1.
-protobuf>=6.31.1
+# Bounded above as well: protobuf 7 removed the descriptor API that older generated
+# modules call, which breaks imports in the session and stops the TensorFlow Datasets
+# stack from streaming. The window mirrors data.PROTOBUF_SPEC. Install without
+# --upgrade so a conforming runtime is left in place and no session restart is needed.
+protobuf>=6.31.1,<7
 
 # Vision / arrays (usually already present on Colab, pinned loosely for safety)
 pillow>=10.0.0

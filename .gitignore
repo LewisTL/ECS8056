@@ -21,7 +21,6 @@ __pycache__/
 .ipynb_checkpoints/
 .venv/
 venv/
-*.egg-info/
 tests/
 
 # --- HF / Colab caches ---
