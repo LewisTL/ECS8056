@@ -51,6 +51,16 @@ from PIL import Image
 
 BRIDGE_GCS = "gs://gresearch/robotics/bridge/0.1.0/"
 
+# Supported protobuf runtime window for the TensorFlow Datasets stack, bounded from
+# both sides. The lower bound is set by the `tensorflow-metadata` generated code,
+# which refuses to run on an older runtime. The upper bound is set by released TFDS,
+# which reads dataset metadata through `FieldDescriptor.label`; protobuf 7 removed
+# that attribute, so a newer runtime imports cleanly and then fails deep inside
+# `builder_from_directory`. Both edges are reported before streaming begins.
+PROTOBUF_MIN = (6, 31, 1)
+PROTOBUF_MAX_EXCLUSIVE = (7, 0, 0)
+PROTOBUF_SPEC = 'protobuf>=6.31.1,<7'
+
 # Action layout indices for the flattened 7-vector.
 IDX_TRANSLATION = slice(0, 3)   # world_vector
 IDX_ROTATION = slice(3, 6)      # rotation_delta
@@ -346,6 +356,52 @@ def extract_episode(
     )
 
 
+def release_components(version_text: str) -> tuple[int, ...]:
+    """The leading numeric components of a version string, suffixes discarded."""
+    return tuple(int(part) for part in re.findall(r"\d+", version_text)[:3])
+
+
+def protobuf_runtime_problem(version_text: str) -> str | None:
+    """An actionable message when a protobuf runtime cannot serve the TFDS stack.
+
+    Returns None when the version falls inside the supported window, or when it
+    cannot be parsed, in which case the stack is left to report its own failure
+    rather than being blocked by a version string this function does not recognise.
+    """
+    version = release_components(version_text)
+    if not version:
+        return None
+    if version < PROTOBUF_MIN:
+        cause = (
+            "older than the tensorflow-metadata generated code, which protobuf "
+            "refuses to run on a lower runtime"
+        )
+    elif version >= PROTOBUF_MAX_EXCLUSIVE:
+        cause = (
+            "newer than released TensorFlow Datasets supports: protobuf 7 removed "
+            "`FieldDescriptor.label`, which TFDS uses to read dataset metadata, so "
+            "streaming fails with an AttributeError once a builder is opened"
+        )
+    else:
+        return None
+    return (
+        f"The protobuf runtime ({version_text}) is {cause}. Install a runtime "
+        f"inside the supported window and restart the session:\n"
+        f'    pip install "{PROTOBUF_SPEC}"\n'
+        f"The restart is required because protobuf caches generated modules for the "
+        f"life of the interpreter."
+    )
+
+
+def installed_protobuf_version() -> str:
+    """The installed protobuf runtime version, or an empty string when absent."""
+    try:
+        import google.protobuf as protobuf
+    except ImportError:
+        return ""
+    return getattr(protobuf, "__version__", "")
+
+
 def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5,
                      post_grasp_steps: int = 5, extract_grasp: bool = True,
                      lazy_images: bool = True):
@@ -361,11 +417,15 @@ def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5,
     episodes. The request is dropped with a warning if the installed TFDS rejects
     the decoder specification, since a slower stream is better than none.
     """
-    # Importing TFDS pulls tensorflow-metadata, whose generated code is compiled
-    # against a specific protobuf major version. Recent TensorFlow and
-    # tensorflow-metadata require protobuf 6, and protobuf refuses to run its
-    # generated code on an older runtime (for example gencode 6.31.1 on runtime
-    # 5.29.6). Translate that failure into an actionable instruction.
+    # The TFDS stack is usable only against a bounded range of protobuf runtimes,
+    # and only one edge announces itself at import: a runtime that is too old raises
+    # a version error, while one that is too new imports cleanly and fails later on
+    # a removed descriptor attribute. Checking the version first reports both edges
+    # in the same actionable form, before any download begins.
+    problem = protobuf_runtime_problem(installed_protobuf_version())
+    if problem:
+        raise RuntimeError(problem)
+
     builder_from_directory = None
     try:
         import tensorflow_datasets as tfds
@@ -387,12 +447,10 @@ def stream_episodes(n: int, split_start: int = 0, early_steps: int = 5,
         message = str(exc)
         if "Protobuf" in message or "runtime_version" in message:
             raise RuntimeError(
-                "TensorFlow Datasets failed to import because the protobuf "
-                "runtime is older than the tensorflow-metadata generated code "
-                "(for example gencode 6.31.1 with runtime 5.29.6). Recent "
-                "TensorFlow and tensorflow-metadata require protobuf 6, so "
-                "install a matching runtime and restart the session:\n"
-                "    pip install \"protobuf>=6.31.1,<7\"\n"
+                "TensorFlow Datasets failed to import against the installed "
+                f"protobuf runtime ({installed_protobuf_version() or 'unknown'}). "
+                "Install a runtime inside the supported window and restart the "
+                f'session:\n    pip install "{PROTOBUF_SPEC}"\n'
                 "then restart the runtime before re-running."
             ) from exc
         raise
