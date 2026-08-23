@@ -1707,6 +1707,120 @@ EVALUATION_FIELDS = ["construct_id", "base_scene_id", "configuration", "paired",
                      "seed"]
 
 
+def pair_eligible_ids(scenes) -> set:
+    """Construct ids whose base frame carries both arrangements of the contrast.
+
+    A scene enters the frozen set only as half of a within-frame pair, so one
+    whose frame never yielded the other arrangement cannot contribute however it
+    is judged. Most of a built set is in that position, because a frame supports
+    the opposite arrangement and a same-side one only when both placements fit, so
+    screening the eligible scenes first is the difference between a feasible manual
+    pass and one that spends most of its effort on scenes that cannot be used.
+    """
+    rows = [asdict(s) if isinstance(s, ConstructedScene) else dict(s)
+            for s in scenes]
+    built: dict = {}
+    for row in rows:
+        built.setdefault(str(row["base_scene_id"]), set()).add(row["configuration"])
+    same_side = {CONFIG_SAME_LEFT, CONFIG_SAME_RIGHT}
+    paired = {base for base, configurations in built.items()
+              if CONFIG_OPPOSITE in configurations and configurations & same_side}
+    return {row["construct_id"] for row in rows
+            if str(row["base_scene_id"]) in paired}
+
+
+def project_yield(scenes, review_rows, *, targets=DEFAULT_TARGETS,
+                  candidates_processed: int | None = None) -> dict:
+    """What the pool as built will support, and what filling the targets requires.
+
+    Every rate is measured from the set rather than assumed: the share of base
+    frames that yielded both arrangements, and the share of those pairs whose two
+    scenes both passed the screen. Base frames are the unit throughout, because a
+    same-side cell is filled from frames that also carry the opposite arrangement,
+    so a frame rather than a scene is what a target consumes.
+
+    `candidates_processed` is how many base frames construction has attempted,
+    which the manifest cannot report: it holds the frames that produced a scene and
+    not those rejected before one. Supplying it turns the projection from frames
+    that yield scenes into frames that have to be harvested, which is the number a
+    harvest is sized by.
+
+    Projections are `None` where the measured rate needed for them is zero or
+    undefined, so an unfilled cell cannot be reported as a finite requirement.
+    """
+    rows = [asdict(s) if isinstance(s, ConstructedScene) else dict(s)
+            for s in scenes]
+    decisions = {row["construct_id"]: row.get("decision", DECISION_UNLABELLED)
+                 for row in review_rows}
+    same_side = {CONFIG_SAME_LEFT, CONFIG_SAME_RIGHT}
+
+    by_base: dict = {}
+    for row in rows:
+        by_base.setdefault(str(row["base_scene_id"]), []).append(row)
+
+    paired_frames = 0
+    decided_pairs = 0
+    approved_pairs = 0
+    approved_by_side: dict = {CONFIG_SAME_LEFT: 0, CONFIG_SAME_RIGHT: 0}
+    for members in by_base.values():
+        configurations = {row["configuration"] for row in members}
+        if CONFIG_OPPOSITE not in configurations or not configurations & same_side:
+            continue
+        paired_frames += 1
+        verdicts = {row["construct_id"]: decisions.get(row["construct_id"],
+                                                       DECISION_UNLABELLED)
+                    for row in members}
+        # A frame still holding an unseen scene is not yet decided either way, so
+        # it counts toward neither the approvals nor the rate they are taken over.
+        if any(v == DECISION_UNLABELLED for v in verdicts.values()):
+            continue
+        decided_pairs += 1
+        opposite_ok = any(verdicts[row["construct_id"]] == DECISION_APPROVED
+                          for row in members
+                          if row["configuration"] == CONFIG_OPPOSITE)
+        sides = [row["configuration"] for row in members
+                 if row["configuration"] in same_side
+                 and verdicts[row["construct_id"]] == DECISION_APPROVED]
+        if opposite_ok and sides:
+            approved_pairs += 1
+            approved_by_side[sides[0]] += 1
+
+    frames = len(by_base)
+    pair_rate = paired_frames / frames if frames else float("nan")
+    joint_rate = approved_pairs / decided_pairs if decided_pairs else float("nan")
+    per_candidate = (paired_frames / candidates_processed
+                     if candidates_processed else float("nan"))
+
+    needed = (int(targets.get(CONFIG_SAME_LEFT, 0))
+              + int(targets.get(CONFIG_SAME_RIGHT, 0)))
+    deficit = max(needed - approved_pairs, 0)
+
+    def scaled(rate) -> int | None:
+        if deficit == 0:
+            return 0
+        if rate != rate or rate <= 0:
+            return None
+        return int(np.ceil(deficit / rate))
+
+    pairs_to_build = scaled(joint_rate)
+    return {
+        "base_frames": frames,
+        "paired_frames": paired_frames,
+        "pair_rate": pair_rate,
+        "decided_pairs": decided_pairs,
+        "approved_pairs": approved_pairs,
+        "approved_by_side": approved_by_side,
+        "joint_approval_rate": joint_rate,
+        "paired_frames_needed": needed,
+        "paired_frames_short": deficit,
+        "pairs_to_build": pairs_to_build,
+        "scenes_to_screen": None if pairs_to_build is None else 2 * pairs_to_build,
+        "frames_to_yield_scenes": scaled(joint_rate * pair_rate),
+        "candidates_to_process": scaled(joint_rate * per_candidate),
+        "candidates_processed": candidates_processed,
+    }
+
+
 def select_evaluation_set(scenes, approved, *, targets=DEFAULT_TARGETS, seed: int = 0):
     """Choose the experimental set from the approved scenes.
 

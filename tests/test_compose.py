@@ -46,6 +46,9 @@ from compose_scenes import (
     approval_summary,
     approve,
     approved_ids,
+    DEFAULT_TARGETS,
+    pair_eligible_ids,
+    project_yield,
     build_review_rows,
     build_scene,
     cut_patch,
@@ -1215,6 +1218,105 @@ def test_approval_summary_counts_an_unreviewed_scene_as_neither():
     assert summary["rejected"] == 0
     assert summary["unlabelled"] == len(rows) - 1
     assert summary["approval_rate"] == pytest.approx(1.0)
+
+
+def test_eligibility_excludes_a_frame_that_yielded_one_arrangement():
+    """A scene without a sibling cannot enter the set, so screening it buys nothing."""
+    scenes = _pool(n_left=2, n_right=1, opposite_only=3)
+    eligible = pair_eligible_ids(scenes)
+    assert len(eligible) == 6            # three paired frames, two scenes each
+    unpaired = {s["construct_id"] for s in scenes} - eligible
+    assert len(unpaired) == 3
+    assert all(s["configuration"] == CONFIG_OPPOSITE for s in scenes
+               if s["construct_id"] in unpaired)
+
+
+def test_the_projection_measures_frames_rather_than_scenes():
+    """Approval compounds within a frame, so the scene rate overstates the yield.
+
+    Rejecting one member withdraws the frame, which is what the targets consume.
+    """
+    scenes = _pool(n_left=2, n_right=2)
+    rows = _approve_all(build_review_rows(scenes))
+    approve(rows, "c000000_opposite_left", decision=DECISION_REJECTED,
+            reason=REJECT_PASTE_IMPLAUSIBLE)
+
+    projection = project_yield(scenes, rows,
+                               targets={CONFIG_OPPOSITE: 8, CONFIG_SAME_LEFT: 4,
+                                        CONFIG_SAME_RIGHT: 4})
+    assert projection["base_frames"] == 4
+    assert projection["paired_frames"] == 4
+    assert projection["decided_pairs"] == 4
+    assert projection["approved_pairs"] == 3
+    assert projection["joint_approval_rate"] == pytest.approx(0.75)
+    assert projection["approved_by_side"] == {CONFIG_SAME_LEFT: 1,
+                                             CONFIG_SAME_RIGHT: 2}
+    # Eight paired frames wanted, three held: five more must survive the screen,
+    # so seven pairs have to be built at the measured rate.
+    assert projection["paired_frames_short"] == 5
+    assert projection["pairs_to_build"] == 7
+    assert projection["scenes_to_screen"] == 14
+
+
+def test_the_projection_sizes_a_harvest_from_the_candidate_pool():
+    """The manifest holds frames that produced a scene, not those attempted.
+
+    Without the attempted count the requirement can only be stated in frames that
+    yield scenes, which is not the number a harvest is sized by.
+    """
+    scenes = _pool(n_left=2, n_right=2, opposite_only=4)
+    rows = _approve_all(build_review_rows(scenes))
+    targets = {CONFIG_OPPOSITE: 16, CONFIG_SAME_LEFT: 8, CONFIG_SAME_RIGHT: 8}
+
+    blind = project_yield(scenes, rows, targets=targets)
+    assert blind["candidates_to_process"] is None
+    assert blind["frames_to_yield_scenes"] == 24   # 12 short at a pair rate of 0.5
+
+    sized = project_yield(scenes, rows, targets=targets, candidates_processed=80)
+    assert sized["candidates_to_process"] == 240   # 4 pairs from 80 attempts
+    assert sized["candidates_to_process"] > sized["frames_to_yield_scenes"]
+
+
+def test_the_projection_counts_a_frame_with_an_unseen_scene_as_undecided():
+    """A rate taken over half-screened frames would move as screening continued."""
+    scenes = _pool(n_left=1, n_right=1)
+    rows = build_review_rows(scenes)
+    for row in rows[:2]:                  # one frame decided, the other untouched
+        approve(rows, row["construct_id"], decision=DECISION_APPROVED)
+
+    projection = project_yield(scenes, rows, targets=DEFAULT_TARGETS)
+    assert projection["paired_frames"] == 2
+    assert projection["decided_pairs"] == 1
+    assert projection["approved_pairs"] == 1
+    assert projection["joint_approval_rate"] == pytest.approx(1.0)
+
+
+def test_an_unmeasurable_requirement_is_left_unstated():
+    """A projection from a rate of zero would report a finite, invented number."""
+    scenes = _pool(n_left=1, n_right=1)
+    rows = build_review_rows(scenes)
+    for row in rows:
+        approve(rows, row["construct_id"], decision=DECISION_REJECTED,
+                reason=REJECT_PASTE_IMPLAUSIBLE)
+
+    projection = project_yield(scenes, rows, targets=DEFAULT_TARGETS,
+                               candidates_processed=10)
+    assert projection["approved_pairs"] == 0
+    assert projection["joint_approval_rate"] == pytest.approx(0.0)
+    assert projection["pairs_to_build"] is None
+    assert projection["scenes_to_screen"] is None
+    assert projection["candidates_to_process"] is None
+
+
+def test_a_filled_target_asks_for_nothing_further():
+    scenes = _pool(n_left=2, n_right=2)
+    rows = _approve_all(build_review_rows(scenes))
+    projection = project_yield(scenes, rows,
+                               targets={CONFIG_OPPOSITE: 4, CONFIG_SAME_LEFT: 2,
+                                        CONFIG_SAME_RIGHT: 2})
+    assert projection["paired_frames_short"] == 0
+    assert projection["pairs_to_build"] == 0
+    assert projection["candidates_to_process"] == 0
 
 
 def test_selection_pairs_each_same_side_scene_with_its_own_opposite():

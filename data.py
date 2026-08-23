@@ -931,8 +931,12 @@ def harvest_records(
 # construction target is the pool the constructed experiments are drawn from: only
 # a fraction of base frames survive detection, surface location, and placement, so
 # the pool has to exceed the number of experimental scenes wanted by several times.
+# The multiple is not assumed. `compose_scenes.project_yield` measures it from the
+# set already built, and the harvest is sized from that projection, since the
+# binding rate is the share of frames yielding a within-frame pair whose two scenes
+# both pass the screen, and that compounds well below the per-scene rate.
 DEFAULT_VALIDATION_TARGET = 50
-DEFAULT_CONSTRUCTION_TARGET = 2500
+DEFAULT_CONSTRUCTION_TARGET = 16000
 
 
 def harvest(
