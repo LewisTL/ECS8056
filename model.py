@@ -34,7 +34,26 @@ from importlib.metadata import PackageNotFoundError, version
 import numpy as np
 import torch
 from PIL import Image
-from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+
+try:
+    from transformers import AutoModelForVision2Seq, AutoProcessor, BitsAndBytesConfig
+except ImportError as exc:
+    # The 5.x line withdrew AutoModelForVision2Seq, and OpenVLA's remote modelling
+    # code is written against the pinned releases, so the mismatch is reported here
+    # with the remedy rather than left as a bare missing-name error.
+    try:
+        _transformers_found = version("transformers")
+    except PackageNotFoundError:
+        _transformers_found = "not installed"
+    raise ImportError(
+        f"transformers {_transformers_found} does not provide the interface "
+        f"OpenVLA-7B is loaded through ({exc}). Install the pinned set and restart "
+        f"the session:\n"
+        f'    pip install --only-binary=:all: "transformers==4.40.1" '
+        f'"tokenizers==0.19.1" "timm==0.9.10" "huggingface_hub==0.23.4"\n'
+        f"The restart is required because a module already imported keeps its own "
+        f"code for the life of the interpreter."
+    ) from exc
 
 from action_bins import (
     EMPTY_TOKEN_ID,
