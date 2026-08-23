@@ -61,9 +61,14 @@ GROUP_DEFAULTS = {"frame": "initial", "condition": "baseline", "scene_source": "
 # taken from the manifest when the scene is present there.
 MANIFEST_LABELS = ("category", "feasible_both", "duplicate_target")
 
-# Labels that describe the stimulus and are fixed at prediction time.
+# Labels that describe the stimulus and are fixed at prediction time. The
+# constructed fields are carried through so a pair record states the arrangement,
+# the frame it was composited from, and the recorded target sides in image
+# coordinates, which is what a reader needs to interpret the two actions without
+# joining the constructed manifest again.
 LOG_LABELS = ("spatial_term", "axis", "axis_index", "configuration",
-              "expected_sign", "image_transform")
+              "base_scene_id", "expected_sign_image", "target_sign_a_image",
+              "target_sign_b_image", "image_transform")
 
 ROLE_NEUTRAL = "n"
 

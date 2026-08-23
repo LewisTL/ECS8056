@@ -43,11 +43,21 @@ RUN_METADATA_FIELDS = ("gpu_name", "gpu_capability", "dtype", "seed", "torch",
 # header the migration writes, the rows the sweep appends, and the schema a repair
 # reads an existing log under. A copy in a notebook would be a fourth declaration
 # able to drift from the other three.
+#
+# Two properties of this list are load-bearing for the constructed set. It carries
+# `base_scene_id`, the frame a constructed stimulus was composited from, because the
+# frozen set pairs each same-side scene with the opposite scene built from that same
+# frame and the decisive contrast is meant to be read within a frame; a log without
+# it cannot express the pairing at all. And the geometry columns hold the recorded
+# positions in image coordinates, unconverted. The convention relating image
+# position to the sign of the lateral action is applied in `analysis.py` instead, so
+# revising it is a re-read of the log rather than a repeat of every prediction in it.
 PROBE_EXTRA_FIELDS = (
-    "scene_id", "pair_id", "role", "frame", "scene_source", "condition",
-    "image_transform", "image_scene_id", "configuration", "expected_sign",
-    "target_sign_a", "target_sign_b", "spatial_term", "axis", "axis_index",
-    "category", "feasible_both", "duplicate_target", "sample_idx",
+    "scene_id", "pair_id", "base_scene_id", "role", "frame", "scene_source",
+    "condition", "image_transform", "image_scene_id", "configuration",
+    "expected_sign_image", "target_sign_a_image", "target_sign_b_image",
+    "spatial_term", "axis", "axis_index", "category", "feasible_both",
+    "duplicate_target", "sample_idx",
 )
 
 # Resolved header per log path, so the header is not re-read from a mounted drive

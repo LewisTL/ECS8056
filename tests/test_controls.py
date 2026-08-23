@@ -158,6 +158,50 @@ def test_swapped_scene_id_matches_the_mapping():
     assert swapped_scene_id("s2", ids, seed=0) == mapping["s2"]
 
 
+def _grouped_ids(n_bases=8):
+    """Two arrangements per base frame, as the frozen evaluation set holds."""
+    ids, groups = [], {}
+    for base in range(n_bases):
+        for arrangement in ("opposite", "same_side"):
+            scene = f"c{base}_{arrangement}"
+            ids.append(scene)
+            groups[scene] = f"f{base}"
+    return ids, groups
+
+
+@pytest.mark.parametrize("seed", range(8))
+def test_the_swap_never_draws_from_the_same_base_frame(seed):
+    """A sibling image holds the same background and a real referent, so it is
+    not the referent-free control the condition is supposed to be."""
+    ids, groups = _grouped_ids()
+    mapping = build_scene_swap(ids, seed=seed, groups=groups)
+    assert sorted(mapping.values()) == sorted(ids)
+    for scene, replacement in mapping.items():
+        assert replacement != scene
+        assert groups[replacement] != groups[scene]
+
+
+def test_the_grouped_swap_is_deterministic():
+    ids, groups = _grouped_ids()
+    assert (build_scene_swap(ids, seed=3, groups=groups)
+            == build_scene_swap(ids, seed=3, groups=groups))
+
+
+def test_an_ungrouped_scene_is_constrained_only_against_itself():
+    ids, groups = _grouped_ids(n_bases=3)
+    loose = ["extra_a", "extra_b"]
+    mapping = build_scene_swap(ids + loose, seed=0, groups=groups)
+    assert all(key != value for key, value in mapping.items())
+
+
+def test_the_swap_refuses_rather_than_weakening_the_control():
+    # Both scenes share a frame, so no assignment satisfies the constraint and
+    # relaxing it silently would hand each scene its sibling's image.
+    with pytest.raises(ValueError, match="no admissible replacement"):
+        build_scene_swap(["c0_a", "c0_b"], seed=0,
+                         groups={"c0_a": "f0", "c0_b": "f0"})
+
+
 # --------------------------------------------------------------------------- #
 # Instruction transforms
 # --------------------------------------------------------------------------- #
@@ -270,7 +314,9 @@ def test_plan_stimuli_expands_the_lateral_factorial():
     assert {(s.condition, s.role) for s in stimuli} == {
         ("baseline", "a"), ("baseline", "b"),
         ("neutral", "n"),
-        ("mirror", "a"), ("mirror_neutral", "n"),
+        # Both instructions run under the mirror, so a scene with recorded
+        # geometry yields the full contrast on the reflected stimulus too.
+        ("mirror", "a"), ("mirror", "b"), ("mirror_neutral", "n"),
         ("swapped_scene", "a"), ("swapped_scene", "b"),
     }
 

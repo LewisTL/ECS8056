@@ -16,7 +16,9 @@ factor at a time:
     fixed. A model that reads lateral position must reverse its lateral output.
     Paired with the term-stripped instruction this measures object grounding,
     which is the necessary condition the language claim rests on rather than the
-    claim itself.
+    claim itself. On a scene whose geometry was recorded, reflection also negates
+    that geometry, so running both instructions under the mirror yields a second
+    measurement of the same contrast on a stimulus the model has not seen.
   * Pairing an instruction with a different scene leaves the language intact and
     removes its referent. A difference that survives is lexical.
   * Removing the spatial term gives a within-scene reference, so the term's
@@ -101,9 +103,11 @@ CONDITIONS: dict[str, Condition] = {
                     "against which the term's marginal effect is measured.",
         ),
         Condition(
-            CONDITION_MIRROR, IMAGE_MIRROR, (ROLE_A,), lateral_only=True,
+            CONDITION_MIRROR, IMAGE_MIRROR, (ROLE_A, ROLE_B), lateral_only=True,
             purpose="Lateral antisymmetry: with the instruction fixed, a model "
-                    "that reads lateral position must reverse its lateral output.",
+                    "that reads lateral position must reverse its lateral output. "
+                    "Both instructions are run, so a scene with recorded geometry "
+                    "also yields the full contrast on a reflected stimulus.",
         ),
         Condition(
             CONDITION_MIRROR_NEUTRAL, IMAGE_MIRROR, (ROLE_NEUTRAL,), lateral_only=True,
@@ -183,31 +187,48 @@ def noise_image(image: Image.Image, seed: int = 0) -> Image.Image:
     return Image.fromarray(array, mode="RGB")
 
 
-def swapped_scene_id(scene_id, scene_ids, seed: int = 0):
+def swapped_scene_id(scene_id, scene_ids, seed: int = 0, groups: dict | None = None):
     """Pick the scene whose image replaces this scene's, under a derangement.
 
     A derangement is a permutation with no fixed point, so no scene is ever
     paired with its own image and the control cannot silently degrade into the
-    baseline. The permutation is a deterministic function of `scene_ids` and
-    `seed`, so a resumed probe run reproduces the same assignment.
+    baseline. The permutation is a deterministic function of `scene_ids`,
+    `groups`, and `seed`, so a resumed probe run reproduces the same assignment.
 
     Args:
         scene_id: the scene whose replacement is wanted.
         scene_ids: the full ordered pool of scene identifiers.
         seed: permutation seed.
+        groups: see `build_scene_swap`.
 
     Raises ValueError when the pool holds fewer than two scenes, where no
     derangement exists.
     """
-    return build_scene_swap(scene_ids, seed=seed)[scene_id]
+    return build_scene_swap(scene_ids, seed=seed, groups=groups)[scene_id]
 
 
-def build_scene_swap(scene_ids, seed: int = 0) -> dict:
+def build_scene_swap(scene_ids, seed: int = 0, groups: dict | None = None) -> dict:
     """Map every scene id to a different scene id, deterministically.
 
     Uses a random rotation of a shuffled ordering. A rotation by a non-zero
     offset has no fixed point by construction, which avoids the rejection loop a
     naive shuffle-and-retry would need and keeps the result reproducible.
+
+    `groups` maps a scene id to a group whose members must not supply each
+    other's replacement image, and excluding a group is stronger than excluding
+    the scene itself. Constructed scenes are built in groups from one base frame,
+    and the frozen set holds several arrangements of the same frame by design, so
+    an unconstrained derangement can hand a scene a near-copy of its own image:
+    the same background, the same object, and a genuine referent for an
+    instruction the control is supposed to strand. Scenes with no entry in
+    `groups` are constrained only against themselves.
+
+    Collisions left by the rotation are repaired by exchanging the replacements
+    of two scenes, which keeps the result a permutation. The exchange partner is
+    the first admissible one in a deterministic order, so the mapping stays a
+    function of the inputs alone. A pool whose groups leave no admissible
+    assignment raises rather than quietly relaxing the constraint, since a
+    control that silently weakened itself is worse than one that stops.
     """
     ids = list(scene_ids)
     if len(ids) < 2:
@@ -215,10 +236,43 @@ def build_scene_swap(scene_ids, seed: int = 0) -> dict:
             "a scene swap needs at least two scenes; with fewer, every "
             "assignment would pair a scene with its own image"
         )
+    groups = dict(groups or {})
+
+    def group_of(scene_id):
+        # Its own identity when ungrouped, so the fixed-point rule is the same rule.
+        return groups.get(scene_id, ("__self__", scene_id))
+
+    def admissible(scene_id, replacement) -> bool:
+        return group_of(scene_id) != group_of(replacement)
+
     rng = np.random.default_rng(seed)
     order = list(rng.permutation(len(ids)))
     offset = int(rng.integers(1, len(ids)))  # non-zero, so no element maps to itself
-    return {ids[order[i]]: ids[order[(i + offset) % len(ids)]] for i in range(len(ids))}
+    mapping = {ids[order[i]]: ids[order[(i + offset) % len(ids)]]
+               for i in range(len(ids))}
+
+    conflicts = [s for s in ids if not admissible(s, mapping[s])]
+    if conflicts:
+        # A fixed candidate order keeps the repair reproducible while still
+        # depending on the seed through the rotation it repairs.
+        candidates = [ids[int(i)] for i in rng.permutation(len(ids))]
+        for scene in conflicts:
+            if admissible(scene, mapping[scene]):
+                continue
+            for other in candidates:
+                if other == scene:
+                    continue
+                if (admissible(scene, mapping[other])
+                        and admissible(other, mapping[scene])):
+                    mapping[scene], mapping[other] = mapping[other], mapping[scene]
+                    break
+            else:
+                raise ValueError(
+                    f"no admissible replacement image for {scene!r}: every other "
+                    "scene in the pool belongs to its group. Widen the pool or "
+                    "drop the grouping constraint deliberately."
+                )
+    return mapping
 
 
 def apply_image_transform(kind: str, image: Image.Image, *, seed: int = 0) -> Image.Image:

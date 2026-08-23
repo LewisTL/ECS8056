@@ -61,15 +61,18 @@ def test_canonical_fields_cover_every_part_of_a_row_in_order():
     assert len(fields) == len(set(fields))
 
 
-def test_the_probe_row_is_the_width_the_broken_log_reported():
+def test_the_probe_row_width_is_declared_rather_than_discovered():
     """A regression pinned to the observed failure.
 
-    The log that could not be parsed had a 34-column header and 66-column rows.
-    The 66 is the full probe schema, which is what confirms the rows were correct
-    and the header was the part that was wrong.
+    The log that could not be parsed had a 34-column header against rows written
+    at the full probe width, which was 66 columns when the fault was found and is
+    67 now that constructed scenes contribute `base_scene_id`. The width is
+    asserted rather than derived so that adding a column is a deliberate edit here
+    too, which is what keeps a schema change from passing unnoticed while a log
+    written under the previous width is still being appended to.
     """
-    assert len(probe_log_fields()) == 66
-    assert len(canonical_log_fields(PROBE_EXTRA, with_readout=False)) == 37
+    assert len(probe_log_fields()) == 67
+    assert len(canonical_log_fields(PROBE_EXTRA, with_readout=False)) == 38
 
 
 def test_canonical_fields_without_a_readout_omit_only_the_readout():

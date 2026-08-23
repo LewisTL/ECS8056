@@ -17,11 +17,24 @@ pattern across them rather than on any single test:
   * `congruence_test` asks whether the term's effect tracks the recorded geometry
     or a fixed word-to-direction mapping, which is the decisive contrast.
 
-Two conventions apply throughout. Statistics are computed on the continuous
-expected-bin readout (`c*` columns) where available, because the argmax action is
-quantised at roughly the size of the effect. And a null is reported with an
-equivalence test rather than a non-significant p value, since the claim in the
-null case is that the effect is negligible, not that it is unproven.
+Four conventions apply throughout.
+
+Statistics are computed on the continuous expected-bin readout (`c*` columns)
+where available, because the argmax action is quantised at roughly the size of the
+effect. A null is reported with an equivalence test rather than a non-significant
+p value, since the claim in the null case is that the effect is negligible, not
+that it is unproven.
+
+The recorded geometry reaches these functions in image coordinates, and the
+convention relating image position to the sign of the lateral action is applied
+here through `lateral_sign`. Holding it outside the prediction log means a
+revision costs a re-read rather than a repeat of every prediction, and it keeps
+the one unresolved link in the chain visible at the point it is used.
+
+Any statistic that reads the sign of a prediction accepts `min_magnitude`. Below
+one action bin a sign is not a decision the model could execute, and counting
+sub-bin values as choices pulls every sign-based rate toward one half, which
+attenuates exactly the contrast the constructed scenes were built to expose.
 
 Helpers are shared by the analysis and plotting notebooks so both report
 identical numbers.
@@ -37,6 +50,17 @@ from scipy import stats
 # before the continuous columns existed.
 CONTINUOUS_COLS = [f"c{i}" for i in range(7)]
 ACTION_COLS = [f"a{i}" for i in range(7)]
+
+# Recorded geometry as the probe logs it: the side of the start position a target
+# sits on in image coordinates, where negative is further left in the frame.
+EXPECTED_SIGN_COL = "expected_sign_image"
+TARGET_SIGN_COLS = {"a": "target_sign_a_image", "b": "target_sign_b_image"}
+
+# The side of the frame a lateral term names, in the same image coordinates. This
+# is a fact about the words, independent of how image position maps to the sign of
+# the action, which is why it can be used to classify an instruction as congruent
+# or incongruent with its own target before anything is known about the model.
+LATERAL_TERM_IMAGE_SIGN = {"left": -1, "leftmost": -1, "right": 1, "rightmost": 1}
 
 
 def value_column(axis_index: int, continuous: bool = True) -> str:
@@ -174,6 +198,20 @@ def _pivot_condition(df: pd.DataFrame, condition: str, continuous: bool = True) 
     return wide.reset_index()
 
 
+def _decided(values, min_magnitude: float = 0.0) -> np.ndarray:
+    """Whether each prediction picks a side the model could actually execute.
+
+    A prediction of exactly zero picks no side at all. With `min_magnitude` set to
+    one action bin, a prediction smaller than one bin is also treated as no
+    decision, since the executable action it decodes to is the same either way and
+    its sign is not something the model could act on.
+    """
+    magnitudes = np.abs(np.asarray(values, dtype=float))
+    if min_magnitude > 0:
+        return magnitudes >= min_magnitude
+    return magnitudes > 0
+
+
 def mirror_check(df: pd.DataFrame, continuous: bool = True) -> dict:
     """Does the lateral output reverse when the scene is reflected?
 
@@ -220,6 +258,28 @@ def mirror_check(df: pd.DataFrame, continuous: bool = True) -> dict:
             "mean_abs_change": float(np.mean(np.abs(a - b))) if len(merged) else float("nan"),
         }
     return out
+
+
+def mirror_check_by_configuration(df: pd.DataFrame, continuous: bool = True) -> dict:
+    """`mirror_check` computed separately for each constructed arrangement.
+
+    Pooling the arrangements hides the one that carries the signal. In the
+    `opposite` arrangement the two instances sit either side of the start
+    position, so reflecting the frame maps the layout onto itself: a response near
+    the midpoint gives an antisymmetry and an invariance both near zero, and
+    neither number says whether the visual channel is live. The same-side
+    arrangements put both instances on one side, so a reflection genuinely moves
+    the scene and the check has something to detect.
+
+    Returns a mapping from configuration to the `mirror_check` result for it.
+    Rows with no configuration, which is every unaltered Bridge scene, are grouped
+    under the empty string and can be read as one stratum.
+    """
+    if df.empty or "configuration" not in df.columns:
+        return {}
+    labelled = df.assign(configuration=df["configuration"].fillna("").astype(str))
+    return {str(name): mirror_check(group, continuous=continuous)
+            for name, group in labelled.groupby("configuration")}
 
 
 def lexical_check(df: pd.DataFrame, continuous: bool = True) -> dict:
@@ -279,11 +339,16 @@ def term_effect(df: pd.DataFrame, continuous: bool = True) -> dict:
     }
 
 
-def congruence_test(df: pd.DataFrame, continuous: bool = True) -> dict:
+def congruence_test(df: pd.DataFrame, continuous: bool = True, *,
+                    lateral_sign: int = 1, condition: str = "baseline",
+                    geometry_sign: int = 1, min_magnitude: float = 0.0) -> dict:
     """Does the paired difference point the way the recorded layout demands?
 
-    Requires `expected_sign`, the direction the difference between the two
-    instructions should take given where the two candidate targets sit.
+    Requires `expected_sign_image`, the recorded order of the two candidate
+    targets in image coordinates. `lateral_sign` converts that to the sign the
+    lateral action should take, and `geometry_sign` negates the geometry for a
+    stimulus the recorded layout no longer describes: a mirrored image reverses
+    every recorded side, so the mirror condition is read with `geometry_sign=-1`.
 
     This is a direction check, not the decisive test, and the distinction
     matters. In the `opposite` configuration the term's conventional direction
@@ -298,42 +363,61 @@ def congruence_test(df: pd.DataFrame, continuous: bool = True) -> dict:
     instruction against its own target's side rather than scoring the pair
     against their relative order.
     """
-    baseline = _pivot_condition(df, "baseline", continuous)
-    if baseline.empty or "a" not in baseline or "b" not in baseline:
-        return {"n": 0, "by_configuration": {}}
-    meta = (df[["scene_id", "configuration", "expected_sign"]]
+    empty = {"n": 0, "by_configuration": {}, "n_undecided": 0}
+    pivot = _pivot_condition(df, condition, continuous)
+    if pivot.empty or "a" not in pivot or "b" not in pivot:
+        return empty
+    if EXPECTED_SIGN_COL not in df.columns:
+        return {**empty, "note": f"{EXPECTED_SIGN_COL} was not logged"}
+    meta = (df[["scene_id", "configuration", EXPECTED_SIGN_COL]]
             .drop_duplicates(subset="scene_id"))
-    merged = baseline.merge(meta, on="scene_id", how="left")
-    merged = merged[merged["expected_sign"].notna() & (merged["expected_sign"] != 0)]
+    merged = pivot.merge(meta, on="scene_id", how="left")
+    recorded = pd.to_numeric(merged[EXPECTED_SIGN_COL], errors="coerce")
+    merged = merged[recorded.notna() & (recorded != 0)]
     if merged.empty:
-        return {"n": 0, "by_configuration": {}}
+        return empty
 
     diff = (merged["a"] - merged["b"]).to_numpy()
-    expected = merged["expected_sign"].astype(float).to_numpy()
+    expected = (pd.to_numeric(merged[EXPECTED_SIGN_COL]).astype(float).to_numpy()
+                * np.sign(lateral_sign) * np.sign(geometry_sign))
+    decided = _decided(diff, min_magnitude)
     # Positive means the observed difference points the way the geometry demands.
     oriented = diff * np.sign(expected)
 
+    scored = merged.assign(oriented=oriented, decided=decided)
+    usable = scored[scored["decided"]]
+    if usable.empty:
+        return {**empty, "n_undecided": int(len(scored))}
+
     by_config: dict = {}
-    for name, group in merged.assign(oriented=oriented).groupby("configuration"):
+    for name, group in usable.groupby("configuration"):
         values = group["oriented"].to_numpy()
         by_config[str(name)] = {
             "n": int(values.size),
             "agreement": float(np.mean(values > 0)),
             "test": wilcoxon_paired(values),
         }
+    oriented_usable = usable["oriented"].to_numpy()
     return {
-        "n": int(len(merged)),
-        "agreement": float(np.mean(oriented > 0)),
-        "test": wilcoxon_paired(oriented),
+        "n": int(len(usable)),
+        "n_undecided": int(len(scored) - len(usable)),
+        "min_magnitude": float(min_magnitude),
+        "agreement": float(np.mean(oriented_usable > 0)),
+        "test": wilcoxon_paired(oriented_usable),
         "by_configuration": by_config,
     }
 
 
-def absolute_congruence(df: pd.DataFrame, continuous: bool = True) -> dict:
+def absolute_congruence(df: pd.DataFrame, continuous: bool = True, *,
+                        lateral_sign: int = 1, condition: str = "baseline",
+                        geometry_sign: int = 1,
+                        min_magnitude: float = 0.0) -> dict:
     """Does each instruction move toward the side its own target occupies?
 
-    Requires `target_sign_a` and `target_sign_b`, the side of the start position
-    each instruction's target sits on, recorded when the scene was constructed.
+    Requires `target_sign_a_image` and `target_sign_b_image`, the side of the
+    start position each instruction's target sits on in image coordinates,
+    recorded when the scene was constructed. `lateral_sign` and `geometry_sign`
+    are as in `congruence_test`.
 
     Scoring each instruction separately, rather than scoring the pair against
     their relative order, is what separates the two accounts. On a same-side
@@ -345,33 +429,65 @@ def absolute_congruence(df: pd.DataFrame, continuous: bool = True) -> dict:
     for a lexical one, and the paired difference cannot show this because the
     two accounts produce the same difference.
 
-    On the `opposite` configuration the accounts agree, which is why the rate is
-    reported per configuration rather than pooled.
+    Read with the sign convention in mind. Agreement near one is scene
+    grounding, near one half is a word-to-direction mapping, and near zero is
+    scene grounding under an inverted `lateral_sign` rather than a third account.
+
+    Three groupings are reported. `by_configuration` keeps the arrangements apart,
+    since the `opposite` arrangement cannot separate the accounts. `by_congruency`
+    pools the instruction-level observations by whether the instruction's own term
+    names the side its target actually occupies, which is where the discrimination
+    is concentrated: the congruent instruction is agreed on by both accounts, and
+    the incongruent one is where they part. Pooling that way also doubles the
+    sample for the decisive number, because each same-side arrangement contributes
+    one incongruent instruction whichever side it was built on.
     """
-    baseline = _pivot_condition(df, "baseline", continuous)
-    needed = {"target_sign_a", "target_sign_b"}
-    if baseline.empty or not {"a", "b"} <= set(baseline.columns):
-        return {"n": 0, "by_configuration": {}}
+    empty = {"n": 0, "by_configuration": {}, "by_congruency": {}}
+    pivot = _pivot_condition(df, condition, continuous)
+    needed = set(TARGET_SIGN_COLS.values())
+    if pivot.empty or not {"a", "b"} <= set(pivot.columns):
+        return empty
     if not needed <= set(df.columns):
-        return {"n": 0, "by_configuration": {},
-                "note": "target_sign_a and target_sign_b were not logged"}
+        return {**empty, "note": f"{sorted(needed)} were not logged"}
 
-    meta = (df[["scene_id", "configuration", "target_sign_a", "target_sign_b"]]
-            .drop_duplicates(subset="scene_id"))
-    merged = baseline.merge(meta, on="scene_id", how="left")
-    merged = merged[merged["target_sign_a"].notna() & merged["target_sign_b"].notna()]
-    merged = merged[(merged["target_sign_a"] != 0) & (merged["target_sign_b"] != 0)]
+    meta_cols = ["scene_id", "configuration", *TARGET_SIGN_COLS.values()]
+    if "spatial_term" in df.columns:
+        meta_cols.append("spatial_term")
+    meta = df[meta_cols].drop_duplicates(subset="scene_id")
+    merged = pivot.merge(meta, on="scene_id", how="left")
+    for col in TARGET_SIGN_COLS.values():
+        merged[col] = pd.to_numeric(merged[col], errors="coerce")
+    merged = merged.dropna(subset=list(TARGET_SIGN_COLS.values()))
+    merged = merged[(merged[TARGET_SIGN_COLS["a"]] != 0)
+                    & (merged[TARGET_SIGN_COLS["b"]] != 0)]
     if merged.empty:
-        return {"n": 0, "by_configuration": {}}
+        return empty
 
-    agree_a = np.sign(merged["a"].to_numpy()) == np.sign(
-        merged["target_sign_a"].astype(float).to_numpy())
-    agree_b = np.sign(merged["b"].to_numpy()) == np.sign(
-        merged["target_sign_b"].astype(float).to_numpy())
-    # A zero prediction picks no side, so it cannot agree with either target.
-    resolved = (merged["a"] != 0).to_numpy() & (merged["b"] != 0).to_numpy()
+    convention = np.sign(lateral_sign) * np.sign(geometry_sign)
+    # The side of the action space each instruction's own target lies in.
+    action_side = {role: np.sign(merged[col].to_numpy() * convention)
+                   for role, col in TARGET_SIGN_COLS.items()}
+    agree_a = np.sign(merged["a"].to_numpy()) == action_side["a"]
+    agree_b = np.sign(merged["b"].to_numpy()) == action_side["b"]
+    # A prediction that picks no side the model could execute cannot agree with
+    # either target; see `_decided`.
+    resolved = (_decided(merged["a"].to_numpy(), min_magnitude)
+                & _decided(merged["b"].to_numpy(), min_magnitude))
+
+    # Whether each instruction's own term names the side its target occupies.
+    # Computed from the words and the recorded image position alone, so it does
+    # not depend on the convention the agreement rates are scored under.
+    term = (merged["spatial_term"].astype(str).str.lower().str.strip()
+            if "spatial_term" in merged.columns
+            else pd.Series([""] * len(merged), index=merged.index))
+    term_side_a = term.map(LATERAL_TERM_IMAGE_SIGN)
+    congruent_a = np.sign(merged[TARGET_SIGN_COLS["a"]].to_numpy()) == term_side_a
+    # Role b carries the antonym, which names the opposite side of the frame.
+    congruent_b = np.sign(merged[TARGET_SIGN_COLS["b"]].to_numpy()) == -term_side_a
 
     merged = merged.assign(agree_a=agree_a, agree_b=agree_b, resolved=resolved,
+                           congruent_a=congruent_a, congruent_b=congruent_b,
+                           known_congruency=term_side_a.notna(),
                            both=agree_a & agree_b,
                            n_agree=agree_a.astype(int) + agree_b.astype(int))
 
@@ -390,16 +506,44 @@ def absolute_congruence(df: pd.DataFrame, continuous: bool = True) -> dict:
         }
 
     usable = merged[merged["resolved"]]
+    by_congruency: dict = {}
+    known = usable[usable["known_congruency"]]
+    if len(known):
+        observations = pd.DataFrame({
+            "agree": np.concatenate([known["agree_a"].to_numpy(),
+                                     known["agree_b"].to_numpy()]),
+            "congruent": np.concatenate([known["congruent_a"].to_numpy(),
+                                         known["congruent_b"].to_numpy()]),
+            "configuration": pd.concat([known["configuration"],
+                                        known["configuration"]]).to_numpy(),
+        })
+        for label, flag in (("congruent", True), ("incongruent", False)):
+            group = observations[observations["congruent"] == flag]
+            by_congruency[label] = {
+                "n": int(len(group)),
+                "agreement": (float(group["agree"].mean()) if len(group)
+                              else float("nan")),
+                "by_configuration": {
+                    str(name): {"n": int(len(sub)),
+                                "agreement": float(sub["agree"].mean())}
+                    for name, sub in group.groupby("configuration")
+                },
+            }
+
     return {
         "n": int(len(usable)),
         "n_unresolved": int((~merged["resolved"]).sum()),
+        "min_magnitude": float(min_magnitude),
         "agreement": float(usable["n_agree"].mean() / 2.0) if len(usable) else float("nan"),
         "both_correct": float(usable["both"].mean()) if len(usable) else float("nan"),
         "by_configuration": by_config,
+        "by_congruency": by_congruency,
     }
 
 
-def same_side_test(df: pd.DataFrame, continuous: bool = True) -> dict:
+def same_side_test(df: pd.DataFrame, continuous: bool = True, *,
+                   condition: str = "baseline",
+                   min_magnitude: float = 0.0) -> dict:
     """Separate scene grounding from a word-to-direction mapping.
 
     On a constructed scene with both instances on the same side of the start
@@ -419,21 +563,36 @@ def same_side_test(df: pd.DataFrame, continuous: bool = True) -> dict:
     arrangement was constructed rather than sought.
 
     Reports, per configuration, how often the two instructions produce
-    same-signed actions, and the difference between the configurations with a
-    proportion test.
+    same-signed actions, and the difference between the configurations both
+    unpaired and, where `base_scene_id` is present, paired within the base frame
+    the two arrangements were built from. The paired form is the one the
+    constructed set was designed to support: the frozen evaluation set draws each
+    same-side scene and its `opposite` counterpart from the same frame, so the
+    paired contrast holds the background, the object, the cutout, and the
+    instruction fixed and leaves the arrangement as the only difference. The
+    unpaired contrast is retained because it covers scenes whose counterpart is
+    missing from the log.
+
+    This statistic reads only whether two predictions share a sign, so it is
+    unaffected by the convention relating image position to the sign of the
+    action.
     """
-    baseline = _pivot_condition(df, "baseline", continuous)
-    if baseline.empty or "a" not in baseline or "b" not in baseline:
+    pivot = _pivot_condition(df, condition, continuous)
+    if pivot.empty or "a" not in pivot or "b" not in pivot:
         return {"n": 0, "by_configuration": {}}
-    meta = df[["scene_id", "configuration"]].drop_duplicates(subset="scene_id")
-    merged = baseline.merge(meta, on="scene_id", how="left")
+    meta_cols = ["scene_id", "configuration"]
+    if "base_scene_id" in df.columns:
+        meta_cols.append("base_scene_id")
+    meta = df[meta_cols].drop_duplicates(subset="scene_id")
+    merged = pivot.merge(meta, on="scene_id", how="left")
     merged = merged[merged["configuration"].notna() & (merged["configuration"] != "")]
     if merged.empty:
         return {"n": 0, "by_configuration": {}}
 
     merged = merged.assign(
         same_sign=(merged["a"] * merged["b"] > 0),
-        resolved=(merged["a"] != 0) & (merged["b"] != 0),
+        resolved=(_decided(merged["a"].to_numpy(), min_magnitude)
+                  & _decided(merged["b"].to_numpy(), min_magnitude)),
         magnitude_gap=(merged["a"].abs() - merged["b"].abs()).abs(),
     )
 
@@ -466,9 +625,53 @@ def same_side_test(df: pd.DataFrame, continuous: bool = True) -> dict:
             contrast["p_value"] = float(stats.fisher_exact(table)[1])
     return {
         "n": int(len(merged)),
+        "min_magnitude": float(min_magnitude),
         "by_configuration": by_config,
         "contrast": contrast,
+        "contrast_paired": _paired_contrast(same_side, opposite),
     }
+
+
+def _paired_contrast(same_side: pd.DataFrame, opposite: pd.DataFrame) -> dict:
+    """The same-side against opposite contrast, paired within the base frame.
+
+    Each base frame contributes at most one pair, so the comparison holds the
+    frame fixed and the arrangement is the only thing that differs. Only the
+    discordant pairs carry information about the difference, which is McNemar's
+    test; the exact binomial form is used because the discordant count can be
+    small. Pairs are dropped rather than approximated when a frame supplied only
+    one of the two arrangements, and the count of those is reported.
+    """
+    out = {"n_pairs": 0, "n_discordant": 0, "difference": float("nan"),
+           "p_value": float("nan"), "n_unpaired": 0}
+    if "base_scene_id" not in same_side.columns:
+        return {**out, "note": "base_scene_id was not logged, so no pairing exists"}
+    left = same_side.dropna(subset=["base_scene_id"]).drop_duplicates("base_scene_id")
+    right = opposite.dropna(subset=["base_scene_id"]).drop_duplicates("base_scene_id")
+    if left.empty or right.empty:
+        return out
+    merged = left[["base_scene_id", "same_sign"]].merge(
+        right[["base_scene_id", "same_sign"]], on="base_scene_id",
+        suffixes=("_same_side", "_opposite"))
+    out["n_unpaired"] = int(len(left) + len(right) - 2 * len(merged))
+    if merged.empty:
+        return out
+    a = merged["same_sign_same_side"].to_numpy()
+    b = merged["same_sign_opposite"].to_numpy()
+    only_same_side = int(np.sum(a & ~b))
+    only_opposite = int(np.sum(b & ~a))
+    discordant = only_same_side + only_opposite
+    out.update({
+        "n_pairs": int(len(merged)),
+        "n_discordant": discordant,
+        "only_same_side": only_same_side,
+        "only_opposite": only_opposite,
+        "difference": float(np.mean(a) - np.mean(b)),
+    })
+    if discordant:
+        out["p_value"] = float(
+            stats.binomtest(only_same_side, discordant, 0.5).pvalue)
+    return out
 
 
 def determinism_check(df: pd.DataFrame, continuous: bool = True) -> dict:
