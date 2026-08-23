@@ -812,7 +812,14 @@ def load_constructed_manifest(out_dir: str):
 # duplicate. `SINGLE_HIGH` is the confidence the one instance must clear, and
 # `SINGLE_SECOND_MAX` is the level a second detection must stay below for the
 # frame to count as single-instance.
-SINGLE_HIGH = 0.25
+#
+# The values are calibrated against the score distribution the diagnostic
+# reports on this data rather than carried over from the detector's defaults. The
+# scores are per-query sigmoid confidences and are not comparable across nouns:
+# a container scores around 0.5 where a small produce item scores around 0.2, so
+# a threshold set near the median of the observed distribution rejects whole
+# classes of object rather than uncertain detections.
+SINGLE_HIGH = 0.15
 SINGLE_SECOND_MAX = 0.15
 
 # Only referent-selection instructions can seed a construction; see
@@ -829,6 +836,11 @@ GATE_NO_INSTANCE = "no_instance"
 GATE_WEAK = "weak_instance"
 GATE_MULTI = "multi_instance"
 
+# Reported by the diagnostic rather than by the gate: the query itself was not an
+# object name, so no detection was attempted. Kept distinct from `weak_instance`
+# because a threshold cannot repair it.
+GATE_BAD_NOUN = "unqueryable_noun"
+
 
 def gate_base_frame(instances, *, single_high: float = SINGLE_HIGH,
                     single_second_max: float = SINGLE_SECOND_MAX) -> str:
@@ -837,6 +849,13 @@ def gate_base_frame(instances, *, single_high: float = SINGLE_HIGH,
     A construction needs exactly one instance whose box can be trusted: the box
     fixes what is cut, and a second instance would mean the frame is already a
     two-instance trial with a geometry that was not chosen.
+
+    One instance means one object, not one box. The detector emits several
+    overlapping boxes for a single confidently detected object, so the second
+    score here would usually belong to the first object were they not suppressed
+    first; `detect_instances` does that suppression, and this function assumes it.
+    Passing raw detector output would make almost every frame read as
+    `multi_instance`.
 
     Pure so the thresholds can be reasoned about without a detector, and shared
     with the diagnostic so that what is reported and what is built cannot drift
@@ -934,6 +953,23 @@ def select_base_scenes(manifest_rows, *, categories=DEFAULT_CATEGORIES, limit=No
     return selected
 
 
+def sample_candidates(candidates, *, limit=None, seed: int = 0,
+                      shuffle: bool = True):
+    """A subset of the candidate pool, shuffled before it is truncated.
+
+    Bridge episodes are ordered by scene and task, so a prefix of the manifest
+    holds a few domains rather than a sample of the corpus. The build and the
+    diagnostic both draw through here, so the frames the thresholds are calibrated
+    on are drawn the same way as the frames the build will process. Calibrating on
+    a prefix would fit the thresholds to whichever domains happen to come first.
+    """
+    rows = list(candidates)
+    if shuffle:
+        rng = np.random.default_rng(seed)
+        rows = [rows[int(i)] for i in rng.permutation(len(rows))]
+    return rows[:limit] if limit is not None else rows
+
+
 # Scenes are appended to the manifest in batches. A frame's PNG is named from its
 # base index and configuration, so a batch lost to a disconnected session is
 # rebuilt identically on the next run rather than duplicated.
@@ -1006,12 +1042,8 @@ def run_construction(
     candidates = select_base_scenes(rows, categories=categories,
                                     instruction_mode=instruction_mode,
                                     splits=splits)
-    if shuffle:
-        rng = np.random.default_rng(seed)
-        order = rng.permutation(len(candidates))
-        candidates = [candidates[int(i)] for i in order]
-    if limit is not None:
-        candidates = candidates[:limit]
+    candidates = sample_candidates(candidates, limit=limit, seed=seed,
+                                   shuffle=shuffle)
 
     os.makedirs(os.path.join(out_dir, FRAMES_DIR), exist_ok=True)
     existing = (load_constructed_manifest(out_dir)
@@ -1155,50 +1187,66 @@ def diagnose_detection(
     candidates,
     *,
     limit: int | None = None,
+    seed: int = 0,
+    shuffle: bool = True,
     score_thresh: float = DIAGNOSTIC_FLOOR,
+    working_thresh: float = DEFAULT_SCORE_THRESH,
     single_high: float = SINGLE_HIGH,
     single_second_max: float = SINGLE_SECOND_MAX,
     top_k: int = 3,
 ):
     """Per-frame record of what the detector returned and how the gate ruled.
 
-    A zero yield has two very different causes that the rejection counts alone
-    cannot separate: the queried noun may not name anything in the frame, or the
-    detector may be finding the object and scoring it below a threshold that was
-    set without reference to this data. The first is a extraction fault and the
-    second is a calibration fault, and they call for opposite responses.
+    A zero yield has three causes that the rejection counts alone cannot
+    separate: the query may not name an object at all, the query may name one the
+    frame does not contain, or the detector may be finding the object and scoring
+    it below a threshold that was set without reference to this data. The first
+    two are extraction faults and the third is a calibration fault, and they call
+    for opposite responses.
 
-    Detection is therefore run at `DIAGNOSTIC_FLOOR`, well below the working
-    threshold, and the scores are returned unfiltered. A frame whose best score
-    sits just under `single_high` is evidence the threshold is too strict; a frame
-    with nothing at all above the floor is evidence the query is wrong.
+    The first is settled without a detector: a query that is not an object name is
+    reported as `unqueryable_noun` and no detection is run, so it can neither be
+    mistaken for a weak detection nor contribute a meaningless score to the
+    quantiles that set the threshold.
+
+    Detection is otherwise run at `DIAGNOSTIC_FLOOR`, well below the working
+    threshold, and the scores are returned unfiltered, so a frame whose best score
+    sits just under `single_high` is visible as evidence that the threshold is too
+    strict. The verdict, however, is taken over the instances that clear
+    `working_thresh`, the threshold the build itself uses, so the reported
+    distribution of verdicts is the one construction will produce rather than one
+    produced at a floor no build runs at.
 
     Returns one dict per frame, with the top boxes retained so the notebook can
     draw them and confirm the detection is on the object rather than merely
     confident.
     """
-    from detect_duplicates import detect_instances
+    from detect_duplicates import detect_instances, is_object_noun
 
-    rows = list(candidates)[:limit] if limit is not None else list(candidates)
+    rows = sample_candidates(candidates, limit=limit, seed=seed, shuffle=shuffle)
     out = []
     for row in rows:
         frame_path = os.path.join(cache_dir, row["image_path"])
+        noun = row.get("target_noun", "")
         record = {
             "base_scene_id": str(row.get("episode_index", "")),
             "instruction": row.get("instruction", ""),
-            "noun": row.get("target_noun", ""),
+            "noun": noun,
             "image_path": row["image_path"],
             "scores": [],
             "boxes": [],
             "verdict": "missing_frame",
         }
-        if os.path.isfile(frame_path):
+        if not noun or not is_object_noun(noun):
+            record["verdict"] = GATE_BAD_NOUN
+        elif os.path.isfile(frame_path):
             image = Image.open(frame_path).convert("RGB")
-            found = detect_instances(image, record["noun"], score_thresh=score_thresh)
+            found = detect_instances(image, noun, score_thresh=score_thresh)
             record["scores"] = [round(float(i.score), 4) for i in found[:top_k]]
             record["boxes"] = [i.box for i in found[:top_k]]
             record["verdict"] = gate_base_frame(
-                found, single_high=single_high, single_second_max=single_second_max)
+                [i for i in found if i.score >= working_thresh],
+                single_high=single_high, single_second_max=single_second_max)
         out.append(record)
     return out
 
@@ -1206,9 +1254,14 @@ def diagnose_detection(
 def summarise_diagnosis(records, *, single_high: float = SINGLE_HIGH) -> dict:
     """Aggregate `diagnose_detection` into the numbers that pick a threshold.
 
-    `recoverable` counts frames the gate rejected as weak but where the detector
-    did return a box: these are the frames a lower `single_high` would admit, and
-    their score quantiles say where to put it.
+    `recoverable_by_lowering_single_high` counts frames the gate rejected as weak
+    but where the detector did return a box: these are the frames a lower
+    `single_high` would admit, and their score quantiles say where to put it.
+
+    Frames whose query was not an object name contribute no scores, so they
+    neither inflate that count nor shift the quantiles. Counting them there would
+    overstate what lowering the threshold buys, since the only thing a lower
+    threshold admits for them is a box on an arbitrary region.
     """
     verdicts: dict = {}
     best = []

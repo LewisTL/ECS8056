@@ -52,10 +52,26 @@ SAM_CHECKPOINT = "facebook/sam-vit-base"
 # only counted when its score clears DEFAULT_SCORE_THRESH. The proposal is then
 # decided from the second-highest surviving score: two confident instances imply
 # a duplicate target, a weak or absent second instance implies a single target,
-# and the band between the two is left for manual confirmation.
+# and the band between the two is left for manual confirmation. That reading is
+# only valid once overlapping boxes have been suppressed, since the second score
+# would otherwise often belong to the first object.
 DEFAULT_SCORE_THRESH = 0.10
 DEFAULT_HIGH = 0.30
 DEFAULT_LOW = 0.15
+
+# Overlap above which two boxes are treated as the same instance. OWLv2 predicts
+# one box per image patch and its post-processing applies no suppression, so a
+# single object routinely returns several surviving boxes: the object itself plus
+# its parts and near-copies from neighbouring patches. Any decision that counts
+# instances by counting boxes would read those as a second object.
+#
+# The overlap is measured against the smaller of the two boxes rather than
+# against their union, because a box on a part sits inside the whole-object box
+# and scores a low intersection over union while still describing the same
+# instance. The threshold is deliberately permissive: merging two genuine
+# instances costs one base frame and is caught by the manual screen, whereas
+# splitting one instance in two silently discards a usable frame.
+DEFAULT_OVERLAP = 0.5
 
 # Words that never name the target object, stripped by the regex fallback.
 _DETERMINERS = frozenset({"the", "a", "an", "this", "that", "these", "those",
@@ -84,10 +100,11 @@ _WORD_RE = re.compile(r"[a-z]+")
 # introduce a landmark (`up` in "pick up") are absent, since they are already
 # treated as part of the verb.
 _PHRASE_BOUNDARIES = frozenset({
-    "on", "onto", "in", "into", "from", "inside", "of", "to", "at", "with",
-    "and", "then", "off", "over", "under", "beside", "next", "against",
+    "on", "onto", "in", "into", "from", "inside", "outside", "of", "to", "at",
+    "with", "and", "then", "off", "over", "under", "beside", "next", "against",
     "around", "through", "toward", "towards", "for", "near", "beneath",
-    "behind", "between", "above", "below", "down", "out", "away",
+    "behind", "between", "above", "below", "down", "out", "away", "atop",
+    "upon", "across", "along", "underneath", "within", "past",
 })
 
 # Words that end an instruction by describing the resulting state rather than
@@ -99,8 +116,68 @@ _TRAILING_MODIFIERS = frozenset({
     "open", "together", "apart", "over", "back", "aside", "level", "steady",
 })
 
+# Words that describe how or where a motion goes rather than what is moved
+# ("move the pot diagonally"). They trail the object phrase in the same position
+# a head noun would occupy, so without them the direction word becomes the query.
+_MANNER_WORDS = frozenset({
+    "diagonally", "directly", "forward", "forwards", "backward", "backwards",
+    "upward", "upwards", "downward", "downwards", "inward", "inwards",
+    "outward", "outwards", "clockwise", "counterclockwise", "further",
+    "farther", "closer", "nearer", "again", "halfway", "slightly", "gently",
+    "carefully", "slowly", "quickly", "firmly", "fully", "completely",
+})
+
+# Words that name a region, a quantity, or an abstraction rather than a physical
+# object ("move the pot all the way to the left"). An open-vocabulary query for
+# one of them returns whatever the detector finds most photo-like, which is an
+# arbitrary box, so the frame is better dropped than queried.
+_NON_OBJECT_NOUNS = frozenset({
+    "way", "side", "bit", "thing", "place", "position", "spot", "area",
+    "direction", "top", "bottom", "middle", "centre", "center", "edge",
+    "corner", "front", "end", "half", "part", "all", "it", "them", "they",
+    "there", "here",
+})
+
+# Nouns ending in the adverbial suffix, exempt from the suffix rule below.
+_LY_NOUNS = frozenset({"jelly", "belly", "lily", "holly", "dolly", "doily",
+                       "fly"})
+
+# Shortest word accepted as an object name. Below this length the candidates in
+# these instructions are pronouns and particles rather than objects.
+_MIN_NOUN_LENGTH = 3
+
 # Module-level model cache so the detector is loaded once per process.
 _OWL_CACHE: dict = {}
+
+
+def is_object_noun(word: str) -> bool:
+    """Whether a word can stand as the name of an object to detect.
+
+    A wrong noun is not a neutral failure. It is sent to an open-vocabulary
+    detector, which always returns its best match for whatever it was asked for,
+    so a query for `diagonally` produces a low-scoring box on an arbitrary region
+    instead of nothing at all. Such a frame is then indistinguishable from one
+    where the detector merely scored a real object weakly, and the two call for
+    opposite responses: one is an extraction fault and the other a threshold
+    fault. Refusing the word up front keeps that distinction available.
+
+    In synthesised construction the noun is also written into the instruction, so
+    an unfiltered adverb would yield a nonsensical trial rather than a skipped
+    frame.
+
+    The suffix rule catches adverbs the explicit lists do not enumerate, since
+    manner adverbs are open-class in a way that objects in a kitchen are not. The
+    few object names sharing the suffix are exempted rather than the rule being
+    abandoned.
+    """
+    word = word.strip().lower()
+    if len(word) < _MIN_NOUN_LENGTH:
+        return False
+    if (word in _STOP_WORDS or word in _TRAILING_MODIFIERS
+            or word in _MANNER_WORDS or word in _NON_OBJECT_NOUNS
+            or word in _PHRASE_BOUNDARIES):
+        return False
+    return not (word.endswith("ly") and word not in _LY_NOUNS)
 
 
 def extract_target_noun(instruction: str, tags=None) -> str | None:
@@ -109,10 +186,11 @@ def extract_target_noun(instruction: str, tags=None) -> str | None:
     A regex heuristic is used first because the instructions are short
     imperatives (for example "grab the red block on the right"), a form that
     general-purpose parsers routinely mis-tag by reading the leading verb as a
-    noun or the object noun as a verb. The heuristic strips action verbs,
-    determiners, prepositions, and spatial cues and returns the content word
-    immediately preceding the first spatial cue, which for these instructions is
-    the selected object. A spaCy parse is used only as a fallback when the
+    noun or the object noun as a verb. The     heuristic keeps only words that
+    `is_object_noun` accepts, which removes action verbs, determiners,
+    prepositions, spatial cues, and manner adverbs, and returns the last such word
+    before the first spatial cue, which for these instructions is the selected
+    object. A spaCy parse is used only as a fallback when the
     heuristic finds nothing, and it takes the root of the first object noun
     chunk. `tags` is accepted for interface symmetry with
     `data.classify_instruction` and is currently unused.
@@ -137,16 +215,21 @@ def extract_manipulated_noun(instruction: str) -> str | None:
     mode needs the manipulated object, because that object is the one the episode
     demonstrates is graspable and present in the frame.
 
-    The head is taken as the last content word of the first noun phrase, where
-    the phrase ends at the first preposition. Ending at the preposition is what
-    separates the object from any landmark, and taking the last word rather than
-    the first is what skips modifiers: "grab the red block" gives `block`, not
-    `red`.
+    The head is taken as the last content word of the first noun phrase that can
+    stand as an object name, where the phrase ends at the first preposition.
+    Ending at the preposition is what separates the object from any landmark, and
+    taking the last word rather than the first is what skips modifiers: "grab the
+    red block" gives `block`, not `red`.
+
+    Taking the last word is also what exposes a trailing adverb, which occupies
+    the head's position without naming anything ("move the pot diagonally"). The
+    phrase is therefore scanned from the end and the first word `is_object_noun`
+    accepts is returned, so a modifier at the end is passed over in the same way
+    one at the start is.
 
     A wrong noun here is not merely a wasted frame. In synthesised mode it is
     written into the instruction as well as queried, so an adverb read as an object
-    would produce a nonsensical trial rather than a rejected one, which is why
-    state-describing words are excluded explicitly.
+    would produce a nonsensical trial rather than a rejected one.
     """
     text = instruction.strip().lower()
     if not text:
@@ -169,14 +252,15 @@ def extract_manipulated_noun(instruction: str) -> str | None:
             continue
         phrase.append(word)
 
-    if phrase:
-        return phrase[-1]
+    for word in reversed(phrase):
+        if is_object_noun(word):
+            return word
     return _extract_with_spacy(text)
 
 
 def _extract_with_spacy(text: str) -> str | None:
     """Head noun of the first object noun chunk via spaCy, or None if spaCy is
-    unavailable or finds no noun chunk."""
+    unavailable or finds no chunk headed by a word that names an object."""
     try:
         import spacy
     except ImportError:
@@ -190,13 +274,13 @@ def _extract_with_spacy(text: str) -> str | None:
         _OWL_CACHE["spacy"] = nlp
 
     doc = nlp(text)
-    location_words = SPATIAL_TOKENS | _SPATIAL_PHRASE_WORDS
     for chunk in doc.noun_chunks:
         root = chunk.root
-        if root.text.lower() in location_words:
+        if root.pos_ not in {"NOUN", "PROPN"}:
             continue
-        if root.pos_ in {"NOUN", "PROPN"}:
-            return root.lemma_.lower() or root.text.lower()
+        candidate = (root.lemma_.lower() or root.text.lower())
+        if is_object_noun(candidate):
+            return candidate
     return None
 
 
@@ -215,10 +299,10 @@ def _extract_with_regex(text: str) -> str | None:
             cue_index = i
             break
 
-    before = [w for w in words[:cue_index] if w not in _STOP_WORDS]
+    before = [w for w in words[:cue_index] if is_object_noun(w)]
     if before:
         return before[-1]
-    remaining = [w for w in words if w not in _STOP_WORDS]
+    remaining = [w for w in words if is_object_noun(w)]
     return remaining[0] if remaining else None
 
 
@@ -231,7 +315,9 @@ def classify_counts(
     """Map detection scores to a duplicate-target proposal and a confidence.
 
     The decision is driven by the second-highest detection score, which stands
-    for the confidence that a second instance of the object exists:
+    for the confidence that a second instance of the object exists. That reading
+    requires one score per object, which is what `count_instances` returns once
+    overlapping boxes have been suppressed:
 
       * `yes` when the second-highest score is at least `high` (two confident
         instances of the same object).
@@ -327,6 +413,27 @@ def clip_box(box, width: int, height: int) -> tuple[float, float, float, float]:
     )
 
 
+def box_overlap(box_a, box_b) -> float:
+    """Intersection of two boxes as a fraction of the smaller box's area.
+
+    Chosen over intersection over union because the boxes being compared are
+    frequently nested rather than merely overlapping: a detection on a pot's
+    handle lies wholly inside the detection on the pot, which this measure scores
+    as complete overlap while intersection over union would score it as almost
+    none. Returns 0.0 when either box is degenerate.
+    """
+    ax0, ay0, ax1, ay1 = (float(v) for v in box_a)
+    bx0, by0, bx1, by1 = (float(v) for v in box_b)
+    inter_w = min(ax1, bx1) - max(ax0, bx0)
+    inter_h = min(ay1, by1) - max(ay0, by0)
+    if inter_w <= 0.0 or inter_h <= 0.0:
+        return 0.0
+    smaller = min((ax1 - ax0) * (ay1 - ay0), (bx1 - bx0) * (by1 - by0))
+    if smaller <= 0.0:
+        return 0.0
+    return (inter_w * inter_h) / smaller
+
+
 @dataclass
 class Instance:
     """One detected instance of the queried noun.
@@ -356,12 +463,40 @@ class Instance:
         return self.box[3] - self.box[1]
 
 
-def detect_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THRESH):
+def suppress_overlapping(instances, *, overlap: float = DEFAULT_OVERLAP):
+    """Keep one detection per object, discarding boxes that cover an earlier one.
+
+    Greedy suppression in descending score order: the highest-scoring box is
+    kept, and any later box overlapping a kept box by more than `overlap` is
+    dropped as a redundant view of the same instance rather than as a second one.
+
+    Without this step every consumer that counts instances counts boxes instead.
+    The detector emits a dense set of candidate boxes and applies no suppression
+    of its own, so a single confidently detected object yields a descending
+    cascade of boxes on itself, which reads exactly like a second, slightly less
+    certain instance.
+
+    Pure and model-free, so the merging rule can be tested against boxes chosen
+    to be nested, adjacent, or disjoint.
+    """
+    kept: list = []
+    for instance in sorted(instances, key=lambda i: float(i.score), reverse=True):
+        if any(box_overlap(instance.box, other.box) > overlap for other in kept):
+            continue
+        kept.append(instance)
+    return kept
+
+
+def detect_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THRESH,
+                     overlap: float = DEFAULT_OVERLAP):
     """Detect instances of `noun` in `image`, returning scores with boxes.
 
     `image` may be a PIL image or an HxWx3 array. The query is the target noun
     phrased as "a photo of a <noun>", the standard OWLv2 prompt form. Instances
-    are returned in descending score order.
+    are returned in descending score order, one per object: overlapping boxes are
+    suppressed here rather than by each caller, so a count of returned instances
+    is a count of objects. Passing `overlap=1.0` disables the suppression and
+    returns the detector's raw output.
 
     The boxes are what the duplicate-target proposal discards and the scene
     construction needs: the position of each instance is what defines the
@@ -395,8 +530,7 @@ def detect_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_TH
         Instance(score=float(score), box=clip_box(box, *image.size))
         for score, box in zip(results["scores"].tolist(), results["boxes"].tolist())
     ]
-    instances.sort(key=lambda inst: inst.score, reverse=True)
-    return instances
+    return suppress_overlapping(instances, overlap=overlap)
 
 
 def _sam_mask(image, *, box=None, point=None):
@@ -470,14 +604,17 @@ def segment_surface(image, point):
     return _sam_mask(image, point=point)
 
 
-def count_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THRESH):
-    """Return the per-box detection scores for `noun` in `image` above threshold.
+def count_instances(image, noun: str, *, score_thresh: float = DEFAULT_SCORE_THRESH,
+                    overlap: float = DEFAULT_OVERLAP):
+    """Return the per-instance detection scores for `noun` in `image`.
 
     Thin wrapper over `detect_instances` for callers that need only the scores.
-    Scores are returned in descending order.
+    One score per object, in descending order, since the overlapping boxes the
+    detector emits for a single object are suppressed upstream.
     """
     return [inst.score for inst in
-            detect_instances(image, noun, score_thresh=score_thresh)]
+            detect_instances(image, noun, score_thresh=score_thresh,
+                             overlap=overlap)]
 
 
 def run_auto_pass(
@@ -536,7 +673,7 @@ def run_auto_pass(
         annotations[ep] = {
             "duplicate_target": label,
             "duplicate_score": round(confidence, 4),
-            "duplicate_note": f"auto: noun={noun}, n_boxes={len(scores)}, "
+            "duplicate_note": f"auto: noun={noun}, n_instances={len(scores)}, "
                               f"s2={round(confidence, 4)}",
             "duplicate_source": DUPLICATE_SOURCE_AUTO,
         }

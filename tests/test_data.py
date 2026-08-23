@@ -41,9 +41,10 @@ from data import (
     update_manifest_annotations,
     validation_eligible,
 )
-from detect_duplicates import (classify_counts, clip_box,
+from detect_duplicates import (Instance, box_overlap, classify_counts, clip_box,
                                extract_manipulated_noun, extract_target_noun,
-                               padded_target_size)
+                               is_object_noun, padded_target_size,
+                               suppress_overlapping)
 
 
 def _step(open_gripper: bool) -> dict:
@@ -564,6 +565,86 @@ def test_extract_manipulated_noun_rejects_state_words():
     assert extract_manipulated_noun("flip the pot upright") == "pot"
     assert extract_manipulated_noun("turn the cup over") == "cup"
     assert extract_manipulated_noun("") is None
+
+
+def test_extract_manipulated_noun_passes_over_a_trailing_adverb():
+    """The head position at the end of the phrase is where adverbs land.
+
+    Taking the last content word is what skips leading modifiers, and it is also
+    what promotes a manner adverb into the query. The observed failures are
+    reproduced here: each was sent to the detector as an object name.
+    """
+    assert extract_manipulated_noun("move the pot diagonally") == "pot"
+    assert extract_manipulated_noun("push the bowl forward") == "bowl"
+    assert extract_manipulated_noun("move the cup directly to the left") == "cup"
+    assert extract_manipulated_noun("slide the plate all the way over") == "plate"
+    # A landmark introduced by a location word still closes the object phrase.
+    assert extract_manipulated_noun("put the corn outside the pot") == "corn"
+
+
+def test_extract_noun_returns_nothing_rather_than_a_word_that_names_no_object():
+    """A frame is better dropped than queried with a word that names no object."""
+    assert extract_manipulated_noun("move it to the left") is None
+    assert extract_manipulated_noun("push forward") is None
+
+
+def test_is_object_noun_rejects_adverbs_it_was_never_given():
+    """Manner adverbs are open-class; the suffix rule covers the ones not listed."""
+    assert is_object_noun("banana")
+    assert is_object_noun("pot")
+    assert not is_object_noun("vertically")
+    assert not is_object_noun("gingerly")
+    # Object names sharing the suffix are exempted rather than dropping the rule.
+    assert is_object_noun("jelly")
+
+
+def test_box_overlap_scores_a_nested_box_as_full_overlap():
+    """Intersection over union would score a part inside a whole as almost none.
+
+    The detector returns a box on an object and further boxes on its parts, and
+    they have to read as the same instance.
+    """
+    whole = (100.0, 100.0, 200.0, 200.0)
+    part = (140.0, 140.0, 170.0, 170.0)
+    assert box_overlap(whole, part) == pytest.approx(1.0)
+    assert box_overlap(part, whole) == pytest.approx(1.0)
+    assert box_overlap(whole, (300.0, 300.0, 400.0, 400.0)) == 0.0
+    # Boxes sharing only an edge have no area in common.
+    assert box_overlap(whole, (200.0, 100.0, 300.0, 200.0)) == 0.0
+    # A degenerate box cannot be said to overlap anything.
+    assert box_overlap(whole, (150.0, 150.0, 150.0, 200.0)) == 0.0
+
+
+def test_suppress_overlapping_keeps_one_detection_per_object():
+    """Counting boxes is not counting instances.
+
+    The detector emits a dense set of boxes and suppresses none of them, so a
+    single confident object yields a descending cascade on itself that reads
+    exactly like a second, less certain instance.
+    """
+    cascade = [Instance(score=0.28, box=(110.0, 105.0, 190.0, 195.0)),
+               Instance(score=0.50, box=(100.0, 100.0, 200.0, 200.0)),
+               Instance(score=0.19, box=(140.0, 140.0, 170.0, 170.0))]
+    kept = suppress_overlapping(cascade)
+    assert [i.score for i in kept] == [0.50]
+
+    # A genuine second object elsewhere in the frame survives.
+    two = cascade + [Instance(score=0.31, box=(300.0, 100.0, 380.0, 200.0))]
+    assert [i.score for i in suppress_overlapping(two)] == [0.50, 0.31]
+    # The highest-scoring box of a merged group is the one kept, since it is the
+    # box the construction will cut.
+    assert suppress_overlapping(cascade)[0].box == (100.0, 100.0, 200.0, 200.0)
+
+
+def test_suppression_is_what_makes_the_second_score_mean_a_second_instance():
+    """The duplicate-target proposal reads the second score as a second object."""
+    cascade = [Instance(score=0.50, box=(100.0, 100.0, 200.0, 200.0)),
+               Instance(score=0.40, box=(105.0, 105.0, 195.0, 195.0))]
+    raw = classify_counts([i.score for i in cascade], high=0.3, low=0.15)[0]
+    kept = classify_counts([i.score for i in suppress_overlapping(cascade)],
+                           high=0.3, low=0.15)[0]
+    assert raw == "yes"
+    assert kept == "no"
 
 
 def test_padded_target_size_uses_the_square_the_detector_pads_to():
