@@ -1300,11 +1300,24 @@ def summarise_diagnosis(records, *, single_high: float = SINGLE_HIGH) -> dict:
 # The sample is drawn at random and never chosen, so the inclusion rule stays
 # mechanical: a sample picked by eye would be selected on the same appearance
 # that the labelling then judges, and the agreement would measure nothing.
+#
+# Which scenes it is drawn from is resolved by `agreement_pool` rather than by the
+# caller, so no stage can decide for itself what the pool is.
 
 VALIDATION_NAME = "validation_sample.csv"
 
+# Where an agreement sample was drawn from, recorded with the sample so its
+# provenance is stated rather than inferred from when it happened to be drawn.
+POOL_FROZEN = "frozen"
+POOL_APPROVED = "approved"
+
 VALIDATION_FIELDS = [
     "construct_id", "configuration", "instr_a",
+    # Which pool the scene was drawn from, one of `POOL_FROZEN` or
+    # `POOL_APPROVED`. Recorded per row because an agreement number is only
+    # interpretable against the set it was measured on, and a sample file that
+    # does not say which one leaves that to be inferred from when it was drawn.
+    "pool",
     # Recorded by the pipeline, shown to the annotator only after labelling.
     # `auto_cutout_mode` is carried so that a judgement of the paste can be read
     # against how the duplicate was cut: a box cutout is expected to look worse,
@@ -1320,13 +1333,29 @@ VALIDATION_FIELDS = [
 
 VALIDATION_UNLABELLED = ""
 
+# The hand labels, which are the only columns a redraw carries over from an
+# existing sample file.
+VALIDATION_LABEL_FIELDS = ("human_configuration", "human_two_instances",
+                           "human_gripper_ok", "human_paste_plausible", "notes")
 
-def draw_validation_sample(scenes, n: int = 50, seed: int = 0):
+
+def draw_validation_sample(scenes, n: int = 50, seed: int = 0, retain=(),
+                           pool: str = ""):
     """Draw a random sample of constructed scenes for hand labelling.
 
     Stratified by configuration so the same-side arrangements, which are fewer
     and carry the decisive comparison, are represented rather than left to the
     luck of a simple random draw.
+
+    `retain` names scenes already labelled, which are kept when they are in the
+    pool and topped up around rather than redrawn. Labelling is the scarcest
+    resource in the pipeline, and a pool that grows as screening continues would
+    otherwise discard the work every time the draw was repeated. Retaining is not
+    a departure from mechanical selection: the retained scenes were themselves
+    drawn at random, and restricting a random sample to a subset defined without
+    reference to the draw leaves a random sample of that subset. Ids absent from
+    the pool are not retained, so labels collected on scenes the pool excludes are
+    dropped rather than carried into the number.
     """
     rng = np.random.default_rng(seed)
     by_config: dict = {}
@@ -1336,13 +1365,17 @@ def draw_validation_sample(scenes, n: int = 50, seed: int = 0):
     if not by_config:
         return []
 
+    keep = set(retain)
     per_config = max(1, n // len(by_config))
     drawn = []
     for configuration in sorted(by_config):
         group = by_config[configuration]
-        take = min(per_config, len(group))
-        for index in rng.choice(len(group), size=take, replace=False):
-            drawn.append(group[int(index)])
+        held = [row for row in group if row["construct_id"] in keep]
+        drawn.extend(held)
+        undrawn = [row for row in group if row["construct_id"] not in keep]
+        take = min(max(per_config - len(held), 0), len(undrawn))
+        for index in rng.choice(len(undrawn), size=take, replace=False):
+            drawn.append(undrawn[int(index)])
 
     # Top up from whatever is left, so the requested size is met when the pool
     # allows it even if some configurations are scarce.
@@ -1358,6 +1391,7 @@ def draw_validation_sample(scenes, n: int = 50, seed: int = 0):
         "construct_id": row["construct_id"],
         "configuration": row["configuration"],
         "instr_a": row["instr_a"],
+        "pool": pool,
         "auto_configuration": row["configuration"],
         "auto_gripper_source": row.get("gripper_source", ""),
         "auto_cutout_mode": row.get("cutout_mode", ""),
@@ -1370,7 +1404,13 @@ def draw_validation_sample(scenes, n: int = 50, seed: int = 0):
 
 
 def write_validation_sample(rows, out_dir: str) -> str:
-    """Write or update the validation sample, preserving existing labels."""
+    """Write or update the validation sample, preserving existing labels.
+
+    Only the hand labels are carried over from an existing file. The pipeline's
+    own columns are taken from the rows passed in, so a redraw that changes the
+    pool a scene belongs to is recorded as such instead of keeping the stale
+    value from the previous draw.
+    """
     path = os.path.join(out_dir, VALIDATION_NAME)
     existing = {}
     if os.path.isfile(path):
@@ -1380,7 +1420,8 @@ def write_validation_sample(rows, out_dir: str) -> str:
     for row in rows:
         prior = existing.get(row["construct_id"])
         if prior is not None:
-            row = {**row, **{k: v for k, v in prior.items() if v}}
+            row = {**row, **{k: v for k, v in prior.items()
+                             if v and k in VALIDATION_LABEL_FIELDS}}
         merged.append(row)
     with open(path, "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=VALIDATION_FIELDS)
@@ -1527,9 +1568,11 @@ def build_review_rows(scenes, existing=None):
     Covers the whole set rather than a sample, because the purpose is to decide
     inclusion for each scene. The random sample in `draw_validation_sample` keeps
     its separate purpose of measuring how well the recorded geometry matches human
-    reading, and that measurement has to be taken over reviewed scenes rather than
-    approved ones, since approval conditions on the arrangement being read as
-    recorded.
+    reading, and it is drawn from the pool `agreement_pool` resolves rather than
+    from every scene reviewed here. Approval can be conditioned on without
+    circularity because the screen never sees the recorded arrangement, so a
+    decision carries no information about the quantity the agreement number
+    measures.
     """
     prior = {row["construct_id"]: row for row in (existing or [])}
     rows = []
@@ -1946,6 +1989,42 @@ def evaluation_scenes(out_dir: str, scenes=None):
         if row is not None:
             out.append({**row, "paired": paired.get(entry["construct_id"], "")})
     return out
+
+
+def agreement_pool(out_dir: str, scenes=None, review_rows=None):
+    """The scenes a geometry agreement sample may be drawn from, and which pool.
+
+    Resolved here rather than at the call site. An earlier version let the
+    notebook fall back to the whole constructed manifest when no frozen set
+    existed, which drew the sample from rejected and unscreened scenes and made
+    the agreement number describe a set the probe never runs on.
+
+    The frozen set is the pool once it exists, since agreement is a claim about
+    the stimuli the experiments use. Before the freeze the pool is the approved
+    scenes: a rejected scene is excluded for faults such as an implausible paste
+    that also make the arrangement harder to read, so admitting rejections would
+    understate agreement on the set that is actually used, and an unscreened
+    scene is of unknown quality. Neither substitution is silent, because the pool
+    is returned alongside the rows and recorded with the sample.
+
+    Restricting to approved scenes does not compromise the blind labelling. The
+    screen is decided without the recorded arrangement in view, so approval
+    carries no information about whether the arrangement matches, which is the
+    quantity being measured.
+    """
+    rows = []
+    source = scenes if scenes is not None else load_constructed_manifest(out_dir)
+    for scene in source:
+        rows.append(asdict(scene) if isinstance(scene, ConstructedScene)
+                    else dict(scene))
+
+    frozen = evaluation_scenes(out_dir, rows)
+    if frozen:
+        return frozen, POOL_FROZEN
+
+    approved = approved_ids(review_rows if review_rows is not None
+                            else load_review(out_dir))
+    return [row for row in rows if row["construct_id"] in approved], POOL_APPROVED
 
 
 # --------------------------------------------------------------------------- #

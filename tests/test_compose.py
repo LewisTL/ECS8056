@@ -37,11 +37,14 @@ from compose_scenes import (
     GATE_WEAK,
     MODE_INHERITED,
     MODE_SYNTHESISED,
+    POOL_APPROVED,
+    POOL_FROZEN,
     REJECT_NO_SECOND_INSTANCE,
     REJECT_PASTE_IMPLAUSIBLE,
     SINGLE_HIGH,
     SINGLE_SECOND_MAX,
     SYNTHESISED_TEMPLATE,
+    agreement_pool,
     append_constructed_manifest,
     approval_summary,
     approve,
@@ -646,6 +649,60 @@ def test_validation_labels_survive_a_redraw(tmp_path):
 
     write_validation_sample(draw_validation_sample(rows, n=10, seed=0), str(tmp_path))
     after = load_validation_sample(str(tmp_path))
+    assert sum(1 for r in after if r["human_configuration"]) == 1
+
+
+def test_validation_sample_keeps_scenes_already_labelled():
+    """Labelling is scarce, so a redraw must not discard the work.
+
+    The pool grows as screening continues, and a draw that ignored the labels
+    already collected would select a different set every time it ran.
+    """
+    rows = _scene_rows()
+    first = draw_validation_sample(rows, n=10, seed=0)
+    kept = {r["construct_id"] for r in first}
+
+    # A different seed alone would select a largely different set.
+    fresh = draw_validation_sample(rows, n=10, seed=5)
+    assert {r["construct_id"] for r in fresh} != kept
+
+    again = draw_validation_sample(rows, n=10, seed=5, retain=kept)
+    assert kept <= {r["construct_id"] for r in again}
+    assert len(again) == 10
+
+
+def test_validation_sample_drops_retained_scenes_outside_the_pool():
+    """A label on a scene the pool excludes cannot enter the agreement number."""
+    rows = _scene_rows(10)
+    absent = "c999999_opposite_left"
+    drawn = draw_validation_sample(rows, n=4, seed=0, retain={absent})
+    assert absent not in {r["construct_id"] for r in drawn}
+
+
+def test_validation_sample_records_the_pool_it_came_from():
+    drawn = draw_validation_sample(_scene_rows(), n=6, seed=0, pool=POOL_APPROVED)
+    assert all(r["pool"] == POOL_APPROVED for r in drawn)
+
+
+def test_a_redraw_updates_the_pool_but_keeps_the_labels(tmp_path):
+    """The pool is a pipeline column, not a label, so a redraw refreshes it.
+
+    A sample drawn before the freeze and redrawn after it describes the frozen
+    set, and a stale column would attribute the agreement number to the wrong
+    set.
+    """
+    out_dir = str(tmp_path)
+    rows = _scene_rows()
+    write_validation_sample(
+        draw_validation_sample(rows, n=6, seed=0, pool=POOL_APPROVED), out_dir)
+    labelled = load_validation_sample(out_dir)
+    labelled[0]["human_configuration"] = labelled[0]["auto_configuration"]
+    write_validation_sample(labelled, out_dir)
+
+    write_validation_sample(
+        draw_validation_sample(rows, n=6, seed=0, pool=POOL_FROZEN), out_dir)
+    after = load_validation_sample(out_dir)
+    assert all(r["pool"] == POOL_FROZEN for r in after)
     assert sum(1 for r in after if r["human_configuration"]) == 1
 
 
@@ -1435,6 +1492,63 @@ def test_no_frozen_set_resolves_to_nothing_rather_than_everything(tmp_path):
     out_dir = str(tmp_path)
     write_constructed_manifest(_pool(n_left=1, n_right=1), out_dir)
     assert evaluation_scenes(out_dir) == []
+
+
+# --------------------------------------------------------------------------- #
+# The agreement pool
+# --------------------------------------------------------------------------- #
+def test_agreement_pool_is_the_frozen_set_when_one_exists(tmp_path):
+    out_dir = str(tmp_path)
+    scenes = _pool(n_left=2, n_right=2)
+    write_constructed_manifest(scenes, out_dir)
+    result = select_evaluation_set(
+        scenes, approved_ids(_approve_all(build_review_rows(scenes))),
+        targets={CONFIG_OPPOSITE: 2, CONFIG_SAME_LEFT: 1, CONFIG_SAME_RIGHT: 1},
+        seed=0)
+    write_evaluation_set(result["rows"], out_dir)
+
+    rows, source = agreement_pool(out_dir, scenes)
+    assert source == POOL_FROZEN
+    assert {r["construct_id"] for r in rows} == {
+        r["construct_id"] for r in result["rows"]}
+
+
+def test_agreement_pool_excludes_rejected_and_unscreened_scenes(tmp_path):
+    """Agreement is a claim about the stimuli the probe runs on.
+
+    A rejection cites faults that also make the arrangement harder to read, so
+    admitting rejections would understate agreement on the set actually used, and
+    an unscreened scene is of unknown quality.
+    """
+    out_dir = str(tmp_path)
+    scenes = _pool(n_left=1, n_right=1)
+    write_constructed_manifest(scenes, out_dir)
+    rows = build_review_rows(scenes)
+    approve(rows, scenes[0]["construct_id"], decision=DECISION_APPROVED)
+    approve(rows, scenes[1]["construct_id"], decision=DECISION_REJECTED,
+            reason=REJECT_PASTE_IMPLAUSIBLE)
+    write_review(rows, out_dir)
+
+    pool, source = agreement_pool(out_dir, scenes)
+    assert source == POOL_APPROVED
+    assert [r["construct_id"] for r in pool] == [scenes[0]["construct_id"]]
+
+
+def test_agreement_pool_never_falls_back_to_the_whole_build(tmp_path):
+    """The defect this guards against drew the sample from every scene built.
+
+    An earlier version resolved the pool at the call site and substituted the
+    constructed manifest when no frozen set existed, so the agreement number was
+    measured over rejected and unscreened scenes.
+    """
+    out_dir = str(tmp_path)
+    scenes = _pool(n_left=2, n_right=2)
+    write_constructed_manifest(scenes, out_dir)
+
+    pool, source = agreement_pool(out_dir, scenes)
+    assert source == POOL_APPROVED
+    assert pool == []
+    assert draw_validation_sample(pool, n=50, seed=0) == []
 
 
 # --------------------------------------------------------------------------- #
