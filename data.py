@@ -90,6 +90,17 @@ SPATIAL_PHRASES = (
 TRANSFER_VERBS = frozenset({"put", "place", "move", "stack", "set"})
 TRANSFER_PREPS = frozenset({"on", "onto", "in", "into", "from", "inside"})
 
+# Longer prepositions first so the object-phrase split prefers `onto` over `on`.
+# Used only to decide whether a prenominal `left`/`right` modifies the
+# manipulated object (referent) or a landmark after the preposition (placement).
+_OBJECT_PHRASE_SPLIT_RE = re.compile(
+    r"\b(?:onto|into|inside|from|next|beside|behind|under|over|on|in|to)\b"
+)
+# `the left cup`, `leftmost`, not `the left side` or `the left of`.
+_PRENOMINAL_REFERENT_RE = re.compile(
+    r"\b(?:left|right)most\b|\bthe\s+(?:left|right)\s+(?!side\b|of\b)"
+)
+
 _WORD_RE = re.compile(r"[a-z]+")
 
 
@@ -146,19 +157,45 @@ class InstructionTags:
         return "|".join(parts)
 
 
-def _categorise(tokens: list[str], phrases: list[str]) -> str:
+def _object_phrase(text: str) -> str:
+    """Return the instruction text up to the first relational preposition.
+
+    The chunk before that preposition is the manipulated object. A prenominal
+    `left`/`right` there selects which object to act on. The same modifier after
+    the preposition selects a landmark, which is a destination.
+    """
+    return _OBJECT_PHRASE_SPLIT_RE.split(text, maxsplit=1)[0]
+
+
+def _prenominal_referent(text: str) -> bool:
+    """True when left/right modifies the manipulated object, not a landmark."""
+    return bool(_PRENOMINAL_REFERENT_RE.search(_object_phrase(text)))
+
+
+def _categorise(tokens: list[str], phrases: list[str],
+                *, words: list[str] | None = None,
+                text: str = "") -> str:
     """Assign an instruction category from the shape of the matched spatial cue.
 
     Heuristic (transparent and approximate):
       * "placement_relation": a destination phrase is present (`to the left`,
         `to the right`, `next to`, `in front of`, `on top of`, `close to`,
-        `far from`, `between`). A destination phrase names a goal location,
-        e.g. "move the cloth to the right of the colander".
-      * "referent_selection": a spatial cue is present but no destination
-        phrase matched, so the cue is a bare token or a possessive phrase that
-        modifies the object noun phrase instead, e.g. "pick up the cup on the
-        left".
+        `far from`, `between`), or a transfer verb is present and the spatial
+        term is not a prenominal modifier of the object (`put the cup on the
+        left`, `put the sushi on the left plate`). A destination names a goal
+        location, e.g. "move the cloth to the right of the colander".
+      * "referent_selection": a spatial cue is present but is not a destination:
+        a pickup instruction with a locative (`pick up the cup on the left`), or
+        a prenominal modifier of the object even under a transfer verb (`put
+        the left cup in the box`).
       * "other": no spatial cue.
+
+    Treating `on the left` as a destination phrase would also tag pickup
+    instructions as placement, so the transfer verb is what distinguishes
+    "put the cup on the left" from "pick up the cup on the left". Prenominal
+    position is checked only on the object phrase, so "put the sushi on the
+    left plate" stays placement (the modifier is on the landmark) while "put
+    the left cup in the box" stays referent.
 
     Known limitation: an instruction that carries both a referent modifier and
     a destination phrase (e.g. "put the cup on the left on the shelf") is
@@ -169,9 +206,14 @@ def _categorise(tokens: list[str], phrases: list[str]) -> str:
     """
     if phrases:
         return CATEGORY_PLACEMENT
-    if tokens:
-        return CATEGORY_REFERENT
-    return CATEGORY_OTHER
+    if not tokens:
+        return CATEGORY_OTHER
+    word_set = set(words or [])
+    if TRANSFER_VERBS & word_set:
+        if text and _prenominal_referent(text):
+            return CATEGORY_REFERENT
+        return CATEGORY_PLACEMENT
+    return CATEGORY_REFERENT
 
 
 def classify_instruction(text: str) -> InstructionTags:
@@ -189,7 +231,7 @@ def classify_instruction(text: str) -> InstructionTags:
     tokens = sorted(SPATIAL_TOKENS & word_set)
     phrases = [p for p in SPATIAL_PHRASES if p in lowered]
     transfer = bool(TRANSFER_VERBS & word_set) and bool(TRANSFER_PREPS & word_set)
-    category = _categorise(tokens, phrases)
+    category = _categorise(tokens, phrases, words=words, text=lowered)
     return InstructionTags(spatial_tokens=tokens, spatial_phrases=phrases,
                            has_transfer=transfer, category=category)
 
@@ -1003,9 +1045,10 @@ def update_manifest_annotations(out_dir: str, annotations: dict) -> str:
     the implied placement is possible on BOTH sides of the referent. The same
     reviewed path also carries manual category correction, since a spatial term
     that both selects a referent and names a destination is misread by
-    `_categorise`; the heuristic `category` column is never overwritten, and
-    downstream code reads `category_manual` when populated, falling back to
-    `category`.
+    `_categorise`; this function never overwrites the heuristic `category`
+    column (`refresh_heuristic_categories` is the dedicated rewrite for that
+    column), and downstream code reads `category_manual` when populated,
+    falling back to `category`.
 
     Args:
         out_dir: directory holding manifest.csv.
@@ -1065,9 +1108,53 @@ def update_manifest_annotations(out_dir: str, annotations: dict) -> str:
     return manifest_path
 
 
+def refresh_heuristic_categories(out_dir: str) -> dict:
+    """Recompute the heuristic `category` column from the current classifier.
+
+    Harvest wrote `category` under whatever rule was current then. A later
+    tightening of `_categorise` therefore leaves the stored column stale, and
+    anything that reads the CSV directly (the probe, pair export) would keep
+    the old label. This rewrite updates that column in place. `category_manual`
+    is not touched, so a reviewer's override remains the effective category.
+
+    Returns a dict with `updated`, `total`, and `manifest_path`.
+    """
+    manifest_path = os.path.join(out_dir, "manifest.csv")
+    rows = load_manifest(out_dir)
+    updated = 0
+    for row in rows:
+        new = classify_instruction(row.get("instruction", "")).category
+        if row.get("category") != new:
+            row["category"] = new
+            updated += 1
+    with open(manifest_path, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=MANIFEST_FIELDS)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in MANIFEST_FIELDS})
+    print(f"[refresh_heuristic_categories] updated {updated} of {len(rows)} "
+          f"rows in {manifest_path}")
+    return {
+        "updated": updated,
+        "total": len(rows),
+        "manifest_path": manifest_path,
+    }
+
+
 def _effective_category(row: dict) -> str:
-    """Return category_manual when set, otherwise the heuristic category."""
-    return row.get("category_manual") or row.get("category") or CATEGORY_OTHER
+    """Return category_manual when set, otherwise the current heuristic.
+
+    The current classifier is applied to the instruction rather than the
+    stored `category` column, so a harvest written under an older rule does
+    not keep destination-locative transfer instructions in the referent
+    queue. An empty instruction falls back to the stored column.
+    """
+    if row.get("category_manual"):
+        return row["category_manual"]
+    instruction = row.get("instruction") or ""
+    if instruction:
+        return classify_instruction(instruction).category
+    return row.get("category") or CATEGORY_OTHER
 
 
 def _review_item(row: dict) -> dict:

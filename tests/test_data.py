@@ -35,6 +35,7 @@ from data import (
     protobuf_runtime_problem,
     read_harvest_state,
     release_components,
+    refresh_heuristic_categories,
     review_queue,
     review_summary,
     split_counts,
@@ -95,6 +96,26 @@ def test_classify_instruction_referent_selection():
 def test_classify_instruction_placement_relation():
     tags = classify_instruction("move the cloth to the right of the colander")
     assert tags.category == "placement_relation"
+
+
+def test_classify_instruction_transfer_locative_is_placement():
+    # Bare `left`/`right` after a transfer verb is a destination, including
+    # when the modifier sits on the landmark rather than as `to the left`.
+    assert classify_instruction("put the cup on the left").category == (
+        CATEGORY_PLACEMENT)
+    assert classify_instruction("put the spoon on the left of the bowl").category == (
+        CATEGORY_PLACEMENT)
+    assert classify_instruction("put the sushi on the left plate").category == (
+        CATEGORY_PLACEMENT)
+
+
+def test_classify_instruction_prenominal_object_stays_referent():
+    # `the left cup` modifies the object being moved, so the first action
+    # still depends on the swap even though the verb is a transfer verb.
+    assert classify_instruction("put the left cup in the box").category == (
+        CATEGORY_REFERENT)
+    assert classify_instruction("move the leftmost bowl onto the tray").category == (
+        CATEGORY_REFERENT)
 
 
 def test_make_pair_single_term_swap():
@@ -201,6 +222,55 @@ def test_review_queue_priority_and_filters(tmp_path):
     )
     assert [int(it["episode_index"]) for it in with_non_pairable] == [30]
     assert with_non_pairable[0]["pairable"] is False
+
+
+def test_review_queue_reclassifies_stale_referent_label(tmp_path):
+    # Harvest wrote referent_selection for a transfer locative; the queue
+    # must not keep that row in the referent bucket.
+    out_dir = _write_manifest(tmp_path, [
+        {
+            "episode_index": "1",
+            "instruction": "put the cup on the left",
+            "category": CATEGORY_REFERENT,
+            "feasible_both": "unreviewed",
+        },
+        {
+            "episode_index": "2",
+            "instruction": "pick up the cup on the left",
+            "category": CATEGORY_REFERENT,
+            "feasible_both": "unreviewed",
+        },
+    ])
+    queue = review_queue(out_dir, status="unreviewed", only_pairable=True)
+    assert [int(it["episode_index"]) for it in queue] == [2, 1]
+    assert queue[0]["category"] == CATEGORY_REFERENT
+    assert queue[1]["category"] == CATEGORY_PLACEMENT
+    referents = review_queue(
+        out_dir, status="unreviewed", only_pairable=True,
+        categories=[CATEGORY_REFERENT],
+    )
+    assert [int(it["episode_index"]) for it in referents] == [2]
+
+
+def test_refresh_heuristic_categories_rewrites_stale_column(tmp_path):
+    out_dir = _write_manifest(tmp_path, [
+        {
+            "episode_index": "1",
+            "instruction": "put the cup on the left",
+            "category": CATEGORY_REFERENT,
+        },
+        {
+            "episode_index": "2",
+            "instruction": "pick up the cup on the left",
+            "category": CATEGORY_REFERENT,
+        },
+    ])
+    result = refresh_heuristic_categories(out_dir)
+    assert result["updated"] == 1
+    assert result["total"] == 2
+    rows = {int(r["episode_index"]): r for r in load_manifest(out_dir)}
+    assert rows[1]["category"] == CATEGORY_PLACEMENT
+    assert rows[2]["category"] == CATEGORY_REFERENT
 
 
 def test_review_summary_counts(tmp_path):
@@ -332,6 +402,12 @@ def test_validation_eligible_requires_lateral_referent_pair():
     assert not validation_eligible("put the corn in the pot")
     # Two swappable terms would not be a minimal pair.
     assert not validation_eligible("move the left cup to the right")
+    # A transfer locative is placement even without a destination phrase, so
+    # it must not enter the unaltered validation set.
+    assert not validation_eligible("put the cup on the left")
+    assert not validation_eligible("put the corn in the pot on the left")
+    # Prenominal on the object is still a referent trial.
+    assert validation_eligible("put the left cup in the box")
 
 
 class _FakeTags:
