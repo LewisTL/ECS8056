@@ -30,11 +30,16 @@ from compose_scenes import (
     DEFAULT_FEATHER,
     DEFAULT_MIN_GAP,
     DEFAULT_PADDING,
+    DEPTH_TO_IMAGE_X,
     GATE_BAD_NOUN,
     GATE_MULTI,
     GATE_NO_INSTANCE,
     GATE_OK,
     GATE_WEAK,
+    GRIPPER_SOURCE_DETECTED,
+    GRIPPER_SOURCE_FALLBACK,
+    GRIPPER_Y_UNRECORDED_FRACTION,
+    IMAGE_X_TO_LATERAL_SIGN,
     MODE_INHERITED,
     MODE_SYNTHESISED,
     POOL_APPROVED,
@@ -52,12 +57,14 @@ from compose_scenes import (
     DEFAULT_TARGETS,
     pair_eligible_ids,
     project_yield,
+    action_image_delta,
     build_review_rows,
     build_scene,
     cut_patch,
     diagnose_detection,
     evaluation_scenes,
     gate_base_frame,
+    gripper_image_xy,
     sample_candidates,
     load_evaluation_set,
     load_review,
@@ -70,6 +77,7 @@ from compose_scenes import (
     draw_validation_sample,
     load_constructed_manifest,
     load_validation_sample,
+    locate_gripper,
     manipulation_rate,
     paste_duplicate,
     plan_placement,
@@ -604,6 +612,74 @@ def test_manifest_round_trip(tmp_path):
     assert float(rows[0]["x_pasted"]) == pytest.approx(scenes[0].x_pasted)
 
 
+def test_build_scene_records_the_supplied_gripper_centre():
+    image, box = _frame(100)
+    _, scene = build_scene(image, "12", "pick up the cup on the left", "cup", box,
+                           0.7, CONFIG_OPPOSITE, x_gripper=GRIPPER_X,
+                           y_gripper=48.0)
+    assert scene.x_gripper == GRIPPER_X
+    assert scene.y_gripper == 48.0
+    assert "y_gripper" in CONSTRUCTED_FIELDS
+
+
+def test_action_image_delta_maps_each_component_onto_the_frame():
+    px, py = action_image_delta(0.01, 0.0, 0.0)
+    assert px == pytest.approx(0.01 * IMAGE_X_TO_LATERAL_SIGN)
+    assert py == pytest.approx(0.0)
+
+    px, py = action_image_delta(0.0, 0.01, 0.0)
+    assert px == pytest.approx(0.01 * DEPTH_TO_IMAGE_X)
+    assert py > 0
+
+    px, py = action_image_delta(0.0, 0.0, 0.01)
+    assert px == pytest.approx(0.0)
+    assert py < 0
+
+    scaled = action_image_delta(0.01, 0.02, 0.03, scale=10.0)
+    unit = action_image_delta(0.01, 0.02, 0.03, scale=1.0)
+    assert scaled[0] == pytest.approx(10.0 * unit[0])
+    assert scaled[1] == pytest.approx(10.0 * unit[1])
+
+
+def test_gripper_image_xy_prefers_the_recorded_row():
+    scene = {"x_gripper": 160.0, "y_gripper": 44.0}
+    assert gripper_image_xy(scene, 240.0) == (160.0, 44.0)
+
+
+def test_gripper_image_xy_uses_the_upper_frame_when_the_row_was_not_recorded():
+    x, y = gripper_image_xy({"x_gripper": 160.0}, 240.0)
+    assert x == 160.0
+    assert y == pytest.approx(240.0 * GRIPPER_Y_UNRECORDED_FRACTION)
+    x, y = gripper_image_xy({"x_gripper": 160.0, "y_gripper": ""}, 240.0)
+    assert y == pytest.approx(240.0 * GRIPPER_Y_UNRECORDED_FRACTION)
+
+
+def test_locate_gripper_returns_the_box_centre(monkeypatch):
+    from detect_duplicates import Instance
+
+    def detect(image, query, score_thresh=0.0):
+        return [Instance(score=0.8, box=(100.0, 20.0, 140.0, 60.0))]
+
+    monkeypatch.setattr("detect_duplicates.detect_instances", detect)
+    image, _ = _frame(100)
+    x, y, source, score = locate_gripper(image)
+    assert source == GRIPPER_SOURCE_DETECTED
+    assert x == pytest.approx(120.0)
+    assert y == pytest.approx(40.0)
+    assert score == pytest.approx(0.8)
+
+
+def test_locate_gripper_falls_back_to_the_image_centre(monkeypatch):
+    monkeypatch.setattr("detect_duplicates.detect_instances",
+                        lambda *args, **kwargs: [])
+    image, _ = _frame(100)
+    x, y, source, score = locate_gripper(image)
+    assert source == GRIPPER_SOURCE_FALLBACK
+    assert x == pytest.approx(image.width / 2.0)
+    assert y == pytest.approx(image.height / 2.0)
+    assert score == 0.0
+
+
 # --------------------------------------------------------------------------- #
 # Validation sample
 # --------------------------------------------------------------------------- #
@@ -1053,7 +1129,8 @@ def _stub_perception(monkeypatch, centers):
     monkeypatch.setattr(detect_duplicates, "detect_instances", detect)
     monkeypatch.setattr(detect_duplicates, "segment_instance", segment)
     monkeypatch.setattr(compose_scenes, "locate_gripper",
-                        lambda image: (image.width / 2.0, "detected", 0.9))
+                        lambda image: (image.width / 2.0, image.height / 2.0,
+                                       "detected", 0.9))
     monkeypatch.setattr(
         compose_scenes, "locate_surface",
         lambda image, box: np.ones((image.height, image.width), dtype=bool))

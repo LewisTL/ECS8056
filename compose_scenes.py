@@ -73,6 +73,27 @@ from detect_duplicates import DEFAULT_SCORE_THRESH
 # flipping this constant never requires regenerating scenes.
 IMAGE_X_TO_LATERAL_SIGN = 1
 
+# Overlay of a robot-frame translation onto the camera image. Lateral (dx) maps
+# to image x through IMAGE_X_TO_LATERAL_SIGN. Depth (dy) recedes down the image
+# because the arm enters from the top, so away-from-robot is toward the bottom.
+# Vertical (dz) points up the image. A small depth shear into image x keeps a
+# pure-depth prediction distinct from a pure-vertical one.
+DEPTH_TO_IMAGE_X = 0.35
+DEPTH_TO_IMAGE_Y = 1.0
+VERTICAL_TO_IMAGE_Y = -1.0
+
+
+def action_image_delta(dx, dy, dz, *, scale: float = 1.0,
+                       lateral_sign: int = IMAGE_X_TO_LATERAL_SIGN):
+    """Map a robot-frame translation onto image-pixel offsets.
+
+    `dx` is lateral, `dy` is depth (away from the robot base), `dz` is vertical.
+    Returns `(pixel_x, pixel_y)` with image y increasing downward.
+    """
+    px = (float(dx) * lateral_sign + float(dy) * DEPTH_TO_IMAGE_X) * scale
+    py = (float(dy) * DEPTH_TO_IMAGE_Y + float(dz) * VERTICAL_TO_IMAGE_Y) * scale
+    return px, py
+
 CONFIG_OPPOSITE = "opposite"
 CONFIG_SAME_LEFT = "same_side_left"
 CONFIG_SAME_RIGHT = "same_side_right"
@@ -95,6 +116,11 @@ GRIPPER_MAX_CENTER_Y_FRACTION = 0.75
 
 GRIPPER_SOURCE_DETECTED = "detected"
 GRIPPER_SOURCE_FALLBACK = "image_center"
+
+# Manifests written before y_gripper was recorded have only the column x. The
+# arm enters these frames from above, so the unrecorded row is taken in the
+# upper portion of the frame rather than at mid-height.
+GRIPPER_Y_UNRECORDED_FRACTION = 0.22
 
 # How the duplicate was cut out. A bounding box carries the table and any
 # neighbouring object that falls inside the rectangle, so the copy reads as a
@@ -161,7 +187,7 @@ CONSTRUCTED_FIELDS = [
     "image_path", "image_width", "image_height",
     "x_source", "x_pasted", "y_source",
     "y_base_source", "y_base_pasted", "y_shift_px", "surface_source",
-    "x_gripper", "gripper_source", "gripper_score",
+    "x_gripper", "y_gripper", "gripper_source", "gripper_score",
     "x_target_a", "x_target_b", "expected_sign_image",
     "offset_a_px", "offset_b_px", "separation_px",
     "target_sign_a_image", "target_sign_b_image",
@@ -542,9 +568,9 @@ def paste_duplicate(
 def locate_gripper(image, *, queries=GRIPPER_QUERIES,
                    score_thresh: float = GRIPPER_SCORE_THRESH,
                    max_center_y_fraction: float = GRIPPER_MAX_CENTER_Y_FRACTION):
-    """Estimate the start position's image x.
+    """Estimate the start position's image centre.
 
-    Returns (x, source, score). Falls back to the image centre when no query
+    Returns (x, y, source, score). Falls back to the image centre when no query
     detects the arm, since a wrong-but-declared fallback is safer than a
     confident guess: the `gripper_source` column records which was used, and the
     validation sample reports how often detection agreed with a human.
@@ -568,8 +594,30 @@ def locate_gripper(image, *, queries=GRIPPER_QUERIES,
                 best = found
             break
     if best is None:
-        return float(image.width) / 2.0, GRIPPER_SOURCE_FALLBACK, 0.0
-    return float(best.center_x), GRIPPER_SOURCE_DETECTED, float(best.score)
+        return (float(image.width) / 2.0, float(image.height) / 2.0,
+                GRIPPER_SOURCE_FALLBACK, 0.0)
+    return (float(best.center_x), float(best.center_y),
+            GRIPPER_SOURCE_DETECTED, float(best.score))
+
+
+def gripper_image_xy(scene, image_height: float) -> tuple[float, float]:
+    """Start-position pixel coordinates used to overlay a predicted action.
+
+    y is the recorded detection centre when present. Manifests written before
+    that column existed have only x, and the arm enters from the top of these
+    frames, so the unrecorded row is taken in the upper portion of the frame
+    rather than at mid-height.
+    """
+    x = float(scene["x_gripper"])
+    raw = scene.get("y_gripper", "")
+    if raw not in ("", None):
+        try:
+            y = float(raw)
+        except (TypeError, ValueError):
+            y = float("nan")
+        if y == y:
+            return x, y
+    return x, float(image_height) * GRIPPER_Y_UNRECORDED_FRACTION
 
 
 # --------------------------------------------------------------------------- #
@@ -598,6 +646,7 @@ class ConstructedScene:
     y_shift_px: float
     surface_source: str
     x_gripper: float
+    y_gripper: float
     gripper_source: str
     gripper_score: float
     x_target_a: float
@@ -627,6 +676,7 @@ def build_scene(
     configuration: str,
     *,
     x_gripper: float | None = None,
+    y_gripper: float | None = None,
     gripper_source: str = GRIPPER_SOURCE_FALLBACK,
     gripper_score: float = 0.0,
     padding: int = DEFAULT_PADDING,
@@ -659,6 +709,8 @@ def build_scene(
 
     if x_gripper is None:
         x_gripper = base_image.width / 2.0
+    if y_gripper is None:
+        y_gripper = base_image.height / 2.0
 
     x0, y0, x1, y1 = (float(v) for v in source_box)
     x_source = 0.5 * (x0 + x1)
@@ -708,6 +760,7 @@ def build_scene(
         y_shift_px=float(dy),
         surface_source=surface_source,
         x_gripper=placement.x_gripper,
+        y_gripper=float(y_gripper),
         gripper_source=gripper_source,
         gripper_score=gripper_score,
         x_target_a=placement.x_target_a,
@@ -1101,10 +1154,12 @@ def run_construction(
             continue
 
         if detect_gripper:
-            x_gripper, gripper_source, gripper_score = locate_gripper(base_image)
+            x_gripper, y_gripper, gripper_source, gripper_score = (
+                locate_gripper(base_image))
         else:
-            x_gripper, gripper_source, gripper_score = (
-                base_image.width / 2.0, GRIPPER_SOURCE_FALLBACK, 0.0)
+            x_gripper, y_gripper, gripper_source, gripper_score = (
+                base_image.width / 2.0, base_image.height / 2.0,
+                GRIPPER_SOURCE_FALLBACK, 0.0)
 
         # Segment once per base frame: neither mask depends on where the
         # duplicate is placed, so all configurations share them.
@@ -1119,7 +1174,8 @@ def run_construction(
             result = build_scene(
                 base_image, row["episode_index"], instruction, noun,
                 found[0].box, found[0].score, configuration,
-                x_gripper=x_gripper, gripper_source=gripper_source,
+                x_gripper=x_gripper, y_gripper=y_gripper,
+                gripper_source=gripper_source,
                 gripper_score=gripper_score, padding=padding, feather=feather,
                 min_gap=min_gap, margin=margin, seed=seed, mask=mask,
                 surface=surface, instruction_source=row["instruction_source"],
