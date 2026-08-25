@@ -42,9 +42,10 @@ from data import (
     update_manifest_annotations,
     validation_eligible,
 )
-from detect_duplicates import (Instance, box_overlap, classify_counts, clip_box,
+from detect_duplicates import (DEFAULT_LOCAL_HF_CACHE, Instance, box_overlap,
+                               classify_counts, clip_box,
                                extract_manipulated_noun, extract_target_noun,
-                               is_object_noun, padded_target_size,
+                               hf_cache_dir, is_object_noun, padded_target_size,
                                suppress_overlapping)
 
 
@@ -788,3 +789,28 @@ def test_protobuf_runtime_defers_on_an_unparseable_version():
     """An unrecognised version string must not block streaming by itself."""
     assert protobuf_runtime_problem("") is None
     assert protobuf_runtime_problem("unknown") is None
+
+
+def test_hf_cache_dir_redirects_a_drive_backed_hf_home(monkeypatch):
+    """OWLv2 and SAM must not share OpenVLA's Drive hub cache on Colab."""
+    monkeypatch.delenv("HF_LOCAL_CACHE", raising=False)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.delenv("TRANSFORMERS_CACHE", raising=False)
+    monkeypatch.setenv("HF_HOME", "/content/drive/MyDrive/openvla_cache/hf")
+    assert hf_cache_dir() == DEFAULT_LOCAL_HF_CACHE
+
+
+def test_hf_cache_dir_honours_an_explicit_local_override(monkeypatch):
+    """HF_LOCAL_CACHE wins even when HF_HOME is already on Drive."""
+    monkeypatch.setenv("HF_LOCAL_CACHE", "/scratch/hf")
+    monkeypatch.setenv("HF_HOME", "/content/drive/MyDrive/openvla_cache/hf")
+    assert hf_cache_dir() == "/scratch/hf"
+
+
+def test_hf_cache_dir_leaves_a_local_hf_home_unchanged(monkeypatch):
+    """A filesystem that can symlink should keep the session-wide cache."""
+    monkeypatch.delenv("HF_LOCAL_CACHE", raising=False)
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.delenv("TRANSFORMERS_CACHE", raising=False)
+    monkeypatch.setenv("HF_HOME", "/home/user/.cache/huggingface")
+    assert hf_cache_dir() is None

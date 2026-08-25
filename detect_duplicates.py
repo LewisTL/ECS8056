@@ -48,6 +48,15 @@ OWLV2_CHECKPOINT = "google/owlv2-base-patch16-ensemble"
 # outline rather than along its bounding box. Also ships with transformers.
 SAM_CHECKPOINT = "facebook/sam-vit-base"
 
+# Local hub cache for OWLv2 and SAM when the session-wide HF_HOME sits on a
+# Google Drive FUSE mount. Drive cannot create the hub's snapshot symlink, so
+# from_pretrained copies the blob into the snapshot directory, and that copy of
+# a large safetensors file fails with Errno 5. These two checkpoints are small
+# enough to live on the runtime disk and be re-downloaded each session. OpenVLA
+# stays on Drive, which is why HF_HOME is pointed there. Override with
+# HF_LOCAL_CACHE when a different local path is required.
+DEFAULT_LOCAL_HF_CACHE = "/tmp/hf_local"
+
 # Detection and decision thresholds. A box is
 # only counted when its score clears DEFAULT_SCORE_THRESH. The proposal is then
 # decided from the second-highest surviving score: two confident instances imply
@@ -337,6 +346,41 @@ def classify_counts(
     return "unclear", second
 
 
+def _path_is_drive(path: str) -> bool:
+    """Whether a cache path sits on Colab's Google Drive FUSE mount."""
+    return "/content/drive" in path.replace("\\", "/")
+
+
+def hf_cache_dir() -> str | None:
+    """Hub cache for OWLv2 and SAM, or None to use the session default.
+
+    `HF_LOCAL_CACHE` wins when set. Otherwise a Drive-backed HF_HOME (or the
+    older TRANSFORMERS_CACHE / HF_HUB_CACHE variables) is replaced with
+    `DEFAULT_LOCAL_HF_CACHE`, so the detector checkpoints never share the 7B
+    OpenVLA cache on FUSE. A non-Drive default is left unchanged.
+    """
+    override = os.environ.get("HF_LOCAL_CACHE", "").strip()
+    if override:
+        return override
+    candidates = (
+        os.environ.get("HF_HOME", ""),
+        os.environ.get("HF_HUB_CACHE", ""),
+        os.environ.get("TRANSFORMERS_CACHE", ""),
+    )
+    if any(_path_is_drive(path) for path in candidates):
+        return DEFAULT_LOCAL_HF_CACHE
+    return None
+
+
+def _pretrained_kwargs() -> dict:
+    """`from_pretrained` kwargs that keep OWLv2 and SAM off a Drive cache."""
+    cache_dir = hf_cache_dir()
+    if cache_dir is None:
+        return {}
+    os.makedirs(cache_dir, exist_ok=True)
+    return {"cache_dir": cache_dir}
+
+
 def _load_owl():
     """Load and cache the OWLv2 processor and model on the available device."""
     if "owl" in _OWL_CACHE:
@@ -344,8 +388,12 @@ def _load_owl():
     import torch
     from transformers import Owlv2ForObjectDetection, Owlv2Processor
 
-    processor = Owlv2Processor.from_pretrained(OWLV2_CHECKPOINT)
-    model = Owlv2ForObjectDetection.from_pretrained(OWLV2_CHECKPOINT)
+    kwargs = _pretrained_kwargs()
+    if kwargs:
+        print(f"[detect_duplicates] loading {OWLV2_CHECKPOINT} into "
+              f"{kwargs['cache_dir']}")
+    processor = Owlv2Processor.from_pretrained(OWLV2_CHECKPOINT, **kwargs)
+    model = Owlv2ForObjectDetection.from_pretrained(OWLV2_CHECKPOINT, **kwargs)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device).eval()
     _OWL_CACHE["owl"] = (processor, model, device)
@@ -366,8 +414,12 @@ def _load_sam():
         import torch
         from transformers import SamModel, SamProcessor
 
-        processor = SamProcessor.from_pretrained(SAM_CHECKPOINT)
-        model = SamModel.from_pretrained(SAM_CHECKPOINT)
+        kwargs = _pretrained_kwargs()
+        if kwargs:
+            print(f"[detect_duplicates] loading {SAM_CHECKPOINT} into "
+                  f"{kwargs['cache_dir']}")
+        processor = SamProcessor.from_pretrained(SAM_CHECKPOINT, **kwargs)
+        model = SamModel.from_pretrained(SAM_CHECKPOINT, **kwargs)
         device = "cuda" if torch.cuda.is_available() else "cpu"
         model = model.to(device).eval()
         loaded = (processor, model, device)
