@@ -98,6 +98,8 @@ TRACKING_SET_FIELDS = (
     "object_side_image",
 )
 
+TRACKING_INSTRUCTION = "pick up the {noun}"
+
 
 def value_column(axis_index: int, continuous: bool = True) -> str:
     """Name of the column holding one translation component."""
@@ -781,6 +783,37 @@ def toward_object(dx, x_object, x_gripper, *, min_magnitude: float = 0.0,
     return int(np.sign(dx)) == expected
 
 
+def tracking_instruction(noun: str) -> str:
+    """Object-seeking prompt used by the first-action tracking gate.
+
+    The verb and determiner are fixed so scenes differ only in the named object.
+    Leftover Bridge wording (grab, put, place, stranded modifiers) is not sent.
+    """
+    name = str(noun or "").strip()
+    if not name:
+        raise ValueError("tracking_instruction requires a named object")
+    return TRACKING_INSTRUCTION.format(noun=name)
+
+
+def apply_tracking_instruction(rows):
+    """Set `instr_neutral` from each row's `noun` in place, and return `rows`."""
+    for row in rows:
+        row["instr_neutral"] = tracking_instruction(row["noun"])
+    return rows
+
+
+def stale_tracking_prompt_count(rows) -> int:
+    """How many log rows were predicted under a different prompt than the template."""
+    n = 0
+    for row in rows:
+        noun = str(row.get("noun") or "").strip()
+        if not noun:
+            continue
+        if str(row.get("instruction") or "") != tracking_instruction(noun):
+            n += 1
+    return n
+
+
 def object_tracking_candidates(rows) -> dict:
     """Validation-role rows that can enter the first-action object-tracking gate.
 
@@ -789,7 +822,9 @@ def object_tracking_candidates(rows) -> dict:
     instruction ambiguous, and detection in Notebook 04 would only confirm that.
     Every other validation row with a clean term strip and a nameable object is
     returned, so the detector, not the harvest label, decides that the scene
-    holds exactly one instance.
+    holds exactly one instance. The prompt stored as `instr_neutral` is
+    `pick up the {noun}`, not the stripped Bridge sentence, so leftover verbs
+    do not vary across the gate.
 
     Returns `rows` (enriched with `spatial_term`, `instr_neutral`, and `noun`)
     and `skipped`, a count of rows dropped for each reason, so the notebook can
@@ -824,8 +859,8 @@ def object_tracking_candidates(rows) -> dict:
             continue
         item = dict(row)
         item["spatial_term"] = term
-        item["instr_neutral"] = neutral
         item["noun"] = noun
+        item["instr_neutral"] = tracking_instruction(noun)
         out.append(item)
     return {"rows": out, "skipped": skipped, "n": len(out)}
 

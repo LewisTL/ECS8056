@@ -680,9 +680,10 @@ def validation_eligible(instruction: str) -> bool:
     Three requirements, all on the wording, so the decision can be taken at
     harvest before any frame is inspected. The instruction must yield exactly one
     antonym swap, that swap must contrast the lateral axis, and the term must
-    select a referent rather than name a destination. Stripping the term then
-    leaves a well-formed object-seeking prompt (`pick up the cup`), which is the
-    instruction the first-action gate in Notebook 04 runs.
+    select a referent rather than name a destination. Stripping the term must
+    leave a well-formed instruction, which is the wording filter. The
+    first-action gate then sends `pick up the {noun}` rather than that stripped
+    sentence, so the verb is fixed across the pool.
 
     Roughly one instruction in two hundred qualifies, which is why the validation
     set is harvested across many more episodes than it keeps.
