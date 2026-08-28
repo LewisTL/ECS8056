@@ -1171,6 +1171,39 @@ def object_tracking_by_axis(predictions: pd.DataFrame, geometry: pd.DataFrame, *
     return out
 
 
+def object_tracking_by_sign(
+    predictions: pd.DataFrame,
+    geometry: pd.DataFrame,
+    *,
+    axis_index: int,
+    signs=(1, -1),
+    min_toward: float = 0.7,
+    min_flip: float = 0.5,
+    min_n_per_side: int = 10,
+    **report_kwargs,
+) -> dict:
+    """Score one translation component under each image-x sign convention.
+
+    A signed cloud that prints as a near-zero toward-object rate under +1 is
+    the complement under -1. The dx gate and `TERM_AXIS` are unchanged until
+    a component and a sign clear the same criteria.
+    """
+    out = {}
+    for raw in signs:
+        sign = int(raw)
+        if sign == 0:
+            continue
+        report = object_tracking_report(
+            predictions, geometry, axis_index=int(axis_index),
+            lateral_sign=sign, **report_kwargs)
+        require_mirror = bool(report_kwargs.get("require_mirror", True))
+        gate = object_tracking_gate(
+            report, min_toward=min_toward, min_flip=min_flip,
+            min_n_per_side=min_n_per_side, require_mirror=require_mirror)
+        out[sign] = {"report": report, "gate": gate}
+    return out
+
+
 def object_tracking_gate(report, *, min_toward: float = 0.7,
                          min_flip: float = 0.5, min_n_per_side: int = 10,
                          require_mirror: bool = True) -> dict:
