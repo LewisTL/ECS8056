@@ -26,8 +26,8 @@ Three configurations are produced:
     signs. This configuration is what separates the two accounts, and it cannot
     be sampled from found data.
 
-These scenes carry the experiments. The unaltered Bridge frames are held back for
-the transfer question at the end, and the harvest keeps the two roles disjoint, so
+These scenes carry the experiments. The unaltered Bridge frames supply the
+first-action object-tracking gate, and the harvest keeps the two roles disjoint, so
 `select_base_scenes` builds only from frames assigned the construction role.
 
 Three stages stand between a built scene and an experimental one, and each is
@@ -152,8 +152,9 @@ DEFAULT_MARGIN = 8         # keep pasted content this far inside the frame
 # inherited wording a difference between two scenes could always be attributed to
 # their differing phrasing rather than to their geometry. The cost is external
 # validity, since the instructions are no longer verbatim from the source data.
-# The unmodified Bridge scenes carry that burden instead, which is what they are
-# for, and `instruction_source` records which mode produced each scene.
+# The unmodified Bridge scenes supply the first-action object-tracking gate
+# instead, which is what they are for, and `instruction_source` records which
+# mode produced each scene.
 MODE_INHERITED = "inherited"
 MODE_SYNTHESISED = "synthesised"
 INSTRUCTION_MODES = (MODE_INHERITED, MODE_SYNTHESISED)

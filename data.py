@@ -11,21 +11,22 @@ Responsibilities:
   * Classify instructions as multi-object / spatially-relational via a transparent
     text heuristic (the pilot filter for multi-object scene selection).
   * Harvest the frames into two disjoint roles, one supplying the base frames the
-    constructed experiments are built from and one reserved as the unaltered
-    validation set, and cache them plus a manifest to Google Drive.
-  * Build antonym-swapped minimal pairs and queue scenes for iterative manual
-    feasibility review.
+    constructed experiments are built from and one supplying unaltered frames to
+    the first-action object-tracking gate, and cache them plus a manifest to
+    Google Drive.
+  * Build antonym-swapped minimal pairs.
 
 Two roles, one corpus. The experiments run on constructed scenes (see
-`compose_scenes.py`), which are composited from real Bridge frames, and the
-unaltered Bridge frames answer the separate question of whether a constructed-set
-finding transfers to data that was never edited. A frame that served as a
-construction base is not an independent test of that, so the harvest assigns each
-cached frame exactly one role and records it in `split`. The two roles have
-different admission rules: a validation trial needs an instruction that already
-yields a lateral minimal pair in a referent-selection reading, which is rare,
-while a construction base needs only a nameable object, which is almost every
-frame.
+`compose_scenes.py`), which are composited from real Bridge frames. Unaltered
+Bridge frames supply the first-action object-tracking gate in Notebook 04: the
+check that the first predicted action tracks a unique named object, without which
+a miss toward a named referent on constructed scenes is not interpretable as a
+spatial-language failure. A frame that served as a construction base is not that
+check, so the harvest assigns each cached frame exactly one role and records it
+in `split`. The two roles have different admission rules: a validation trial needs
+an instruction that already yields a lateral minimal pair in a referent-selection
+reading, which is rare, while a construction base needs only a nameable object,
+which is almost every frame.
 
 Schema notes (confirmed against gs://gresearch/robotics/bridge/0.1.0/):
   * observation['image']                       uint8  (480, 640, 3)
@@ -114,15 +115,15 @@ CATEGORY_OTHER = "other"                    # no usable spatial term
 # Set roles
 # --------------------------------------------------------------------------- #
 # The role a cached frame plays. `construction` frames are the base frames the
-# constructed experiments are composited from; `validation` frames are held back
-# unaltered and carry the transfer question at the end of the analysis.
+# constructed experiments are composited from; `validation` frames are kept
+# unaltered and supply the first-action object-tracking gate in Notebook 04.
 #
 # The two are disjoint by construction rather than by convention. A frame that
-# was edited into an experimental stimulus cannot also be evidence that the
-# finding holds on unedited data, because the two measurements would share the
-# same scene, objects, and camera, and any scene-level idiosyncrasy would appear
-# in both. Assignment happens once, at harvest, and is recorded in the manifest
-# so nothing downstream has to re-derive it.
+# was edited into an experimental stimulus cannot also be the instrument check
+# that licenses reading the first action as object-seeking, because the two
+# measurements would share the same scene, objects, and camera. Assignment
+# happens once, at harvest, and is recorded in the manifest so nothing
+# downstream has to re-derive it.
 SPLIT_CONSTRUCTION = "construction"
 SPLIT_VALIDATION = "validation"
 SPLIT_VALUES = (SPLIT_CONSTRUCTION, SPLIT_VALIDATION)
@@ -639,9 +640,9 @@ def make_pair(instruction: str):
 # --------------------------------------------------------------------------- #
 # Drive cache (filtered survivors only)
 # --------------------------------------------------------------------------- #
-# Allowed values for the manual feasibility review field.
+# Allowed values for the `feasible_both` annotation field.
 FEASIBLE_VALUES = frozenset({"yes", "no", "unclear", "unreviewed"})
-# Default value for the manual feasibility review (see update_manifest_annotations).
+# Default value written at harvest (see update_manifest_annotations).
 FEASIBLE_DEFAULT = "unreviewed"
 
 # Allowed values for the duplicate-target field. A scene is a clean referent
@@ -674,14 +675,14 @@ MANIFEST_FIELDS = [
 
 
 def validation_eligible(instruction: str) -> bool:
-    """Whether an instruction can serve as an unaltered validation trial.
+    """Whether an instruction can supply an unaltered object-tracking trial.
 
     Three requirements, all on the wording, so the decision can be taken at
     harvest before any frame is inspected. The instruction must yield exactly one
-    antonym swap, that swap must contrast the lateral axis so it is comparable
-    with the constructed experiments, and the term must select a referent rather
-    than name a destination, since at the initial frame a placement term
-    constrains nothing that the first action reveals.
+    antonym swap, that swap must contrast the lateral axis, and the term must
+    select a referent rather than name a destination. Stripping the term then
+    leaves a well-formed object-seeking prompt (`pick up the cup`), which is the
+    instruction the first-action gate in Notebook 04 runs.
 
     Roughly one instruction in two hundred qualifies, which is why the validation
     set is harvested across many more episodes than it keeps.
@@ -856,10 +857,10 @@ def harvest_records(
     Every frame whose instruction satisfies `validation_eligible` is cached as
     validation and is never offered to construction, whatever the validation
     target. Holding the rule rather than the count fixed is what keeps the roles
-    disjoint under a later decision to enlarge the validation set: if eligible
-    frames spilled into construction once the target was met, growing the
-    validation set afterwards would mean either re-streaming or admitting frames
-    that had already been edited into stimuli.     Remaining frames become
+    disjoint under a later decision to enlarge the object-tracking pool: if
+    eligible frames spilled into construction once the target was met, growing
+    that pool afterwards would mean either re-streaming or admitting frames that
+    had already been edited into stimuli. Remaining frames become
     construction bases until `construction_target` is reached, after which
     streaming continues for validation alone.
 
@@ -1187,14 +1188,13 @@ def _review_item(row: dict) -> dict:
 
 
 def review_summary(out_dir: str, *, splits=(SPLIT_VALIDATION,)) -> dict:
-    """Summarise feasibility review progress for a cached manifest.
+    """Summarise annotation progress for a cached manifest.
 
-    Review qualifies the unaltered validation trials, so the progress counters
-    cover the validation split by default. Construction frames are not reviewed
-    for feasibility: the constructed scene writes its own instruction and its
-    arrangement is chosen rather than found, so feasibility is a property of the
-    stimulus that construction guarantees, and the constructed set has its own
-    approval pass in `compose_scenes.py`. Pass `splits=None` to count every row.
+    Counters cover the validation split by default, which is the object-tracking
+    pool. Construction frames are not annotated for source-wording feasibility:
+    the constructed scene writes its own instruction and its arrangement is
+    chosen rather than found, and the constructed set has its own approval pass
+    in `compose_scenes.py`. Pass `splits=None` to count every row.
 
     Returns a dict with:
       * `by_split`: {split: count} over the whole manifest, unfiltered

@@ -14,9 +14,10 @@ inspection of every scene:
   2. Count instances of that noun in the cached frame with an open-vocabulary
      detector (OWLv2).
   3. Map the detection scores to a proposal (`yes` / `no` / `unclear`) with a
-     transparent decision function. High-confidence proposals are accepted
-     automatically; borderline cases are marked `unclear` and left for manual
-     confirmation in the validation set review notebook.
+     transparent decision function. A `yes` proposal excludes the scene from the
+     first-action object-tracking gate, because two instances make a term-free
+     instruction ambiguous. Notebook 04 re-detects the remaining validation
+     frames and keeps those with exactly one instance.
 
 Heavy dependencies (torch, transformers, and optionally spaCy) are imported
 lazily inside the functions that need them, so the module stays importable in
@@ -431,6 +432,38 @@ def _load_sam():
     return loaded
 
 
+def release_detectors() -> None:
+    """Drop cached OWLv2 and SAM weights so a later OpenVLA load can use the GPU.
+
+    Notebook 04 detects geometry first, then loads OpenVLA on the same device.
+    Leaving the detector in memory would contend with the 7B weights on a T4.
+    Construction (Notebook 03) never loads OpenVLA in the same session, so it
+    does not need this.
+    """
+    for key in ("owl", "sam"):
+        loaded = _OWL_CACHE.pop(key, None)
+        if loaded is None:
+            continue
+        # Cached as (processor, model, device), or None when SAM was unavailable.
+        if not isinstance(loaded, tuple):
+            continue
+        model = loaded[1]
+        if hasattr(model, "to"):
+            try:
+                model.to("cpu")
+            except Exception:  # noqa: BLE001 - best-effort free before delete
+                pass
+        del model
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except ImportError:
+        pass
+
+
 def padded_target_size(width: int, height: int) -> tuple[int, int]:
     """The (height, width) OWLv2 box coordinates are normalised against.
 
@@ -685,8 +718,11 @@ def run_auto_pass(
     given categories, counts the target noun in each cached frame, classifies
     the result, and writes `duplicate_target`, `duplicate_score`,
     `duplicate_note`, and `duplicate_source='auto'` in a single manifest update.
-    Scenes whose target noun cannot be extracted are marked `unclear` and left
-    for manual confirmation. Returns a summary of the proposal counts.
+    Scenes whose target noun cannot be extracted are marked `unclear`. A `yes`
+    proposal excludes the scene from the first-action object-tracking gate in
+    Notebook 04, because two instances make a term-free instruction ambiguous.
+    Notebook 04 re-detects every remaining validation frame and keeps those with
+    exactly one instance. Returns a summary of the proposal counts.
     """
     queue = review_queue(
         out_dir,

@@ -16,6 +16,12 @@ pattern across them rather than on any single test:
     behaviour on the same image with the term removed.
   * `congruence_test` asks whether the term's effect tracks the recorded geometry
     or a fixed word-to-direction mapping, which is the decisive contrast.
+  * `object_tracking_report` asks whether the first predicted action moves toward
+    a unique named object and reverses when that object's image position reverses.
+    That is the instrument check the language tests rest on: a first-step miss
+    toward a named referent is evidence of a spatial-language failure only when
+    this check has already shown that the first action is an object-directed
+    readout.
 
 Four conventions apply throughout.
 
@@ -61,6 +67,29 @@ TARGET_SIGN_COLS = {"a": "target_sign_a_image", "b": "target_sign_b_image"}
 # the action, which is why it can be used to classify an instruction as congruent
 # or incongruent with its own target before anything is known about the model.
 LATERAL_TERM_IMAGE_SIGN = {"left": -1, "leftmost": -1, "right": 1, "rightmost": 1}
+
+# Image-x side of the gripper a unique object occupies. Negative is further left
+# in the frame, matching the constructed-set geometry convention.
+OBJECT_SIDE_LEFT = "left"
+OBJECT_SIDE_RIGHT = "right"
+
+# Conditions the object-tracking gate predicts: the term-stripped instruction on
+# the original frame and on its horizontal mirror. Names match the probe factorial
+# so a later reader does not have to learn a second vocabulary.
+TRACKING_CONDITION_ORIGINAL = "neutral"
+TRACKING_CONDITION_MIRROR = "mirror_neutral"
+
+# Columns of `object_tracking_set.csv`, the frozen geometry the gate scores
+# against. Image coordinates, unconverted: the sign convention is applied in
+# `object_tracking_report` through `lateral_sign`, the same way the constructed
+# set keeps geometry and convention apart.
+TRACKING_SET_FIELDS = (
+    "scene_id", "episode_index", "instruction", "instr_neutral", "spatial_term",
+    "noun", "image_path", "image_width", "image_height",
+    "x_object", "y_object", "object_score",
+    "x_gripper", "y_gripper", "gripper_source", "gripper_score",
+    "object_side_image",
+)
 
 
 def value_column(axis_index: int, continuous: bool = True) -> str:
@@ -700,4 +729,281 @@ def determinism_check(df: pd.DataFrame, continuous: bool = True) -> dict:
         "repeated_stimuli": int(df[repeated].groupby(present).ngroups),
         "max_spread": worst,
         "deterministic": worst == 0.0,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# First-action object tracking
+# --------------------------------------------------------------------------- #
+def object_side_image(x_object, x_gripper) -> int:
+    """Sign of the object's offset from the gripper in image x.
+
+    Negative: the object sits further left in the frame. Zero: they share a
+    column, so no lateral direction is defined.
+    """
+    offset = float(x_object) - float(x_gripper)
+    if offset == 0:
+        return 0
+    return int(np.sign(offset))
+
+
+def mirrored_x(x, image_width) -> float:
+    """Image-x of a point after a horizontal flip of a frame of `image_width`."""
+    return float(image_width) - float(x)
+
+
+def toward_object(dx, x_object, x_gripper, *, min_magnitude: float = 0.0,
+                  lateral_sign: int = 1):
+    """Whether a lateral action points at the object.
+
+    Returns True, False, or None. None when the object shares the gripper's
+    column, so no lateral target exists, or when the action is smaller than
+    `min_magnitude` and so is not a side the model could execute.
+
+    `lateral_sign` is the convention relating image-x to the sign of `dx`: a
+    positive value means an object further right in the frame should produce a
+    positive action. It is applied here rather than baked into the geometry so a
+    revision is a re-read, matching the constructed-set statistics.
+    """
+    side = object_side_image(x_object, x_gripper)
+    if side == 0:
+        return None
+    if not bool(_decided([dx], min_magnitude)[0]):
+        return None
+    expected = side * int(np.sign(lateral_sign))
+    return int(np.sign(dx)) == expected
+
+
+def object_tracking_candidates(rows) -> dict:
+    """Validation-role rows that can enter the first-action object-tracking gate.
+
+    The wording filter is applied here; instance count is not. A scene labelled
+    `duplicate_target='yes'` is excluded because two instances make a term-free
+    instruction ambiguous, and detection in Notebook 04 would only confirm that.
+    Every other validation row with a clean term strip and a nameable object is
+    returned, so the detector, not the harvest label, decides that the scene
+    holds exactly one instance.
+
+    Returns `rows` (enriched with `spatial_term`, `instr_neutral`, and `noun`)
+    and `skipped`, a count of rows dropped for each reason, so the notebook can
+    print the funnel rather than a silent shortfall.
+    """
+    from controls import strip_spatial_term
+    from data import SPLIT_VALIDATION, make_pair
+    from detect_duplicates import extract_target_noun
+
+    out = []
+    skipped = {"split": 0, "duplicate": 0, "pair": 0, "strip": 0, "noun": 0}
+    for row in rows:
+        if str(row.get("split", "")).strip() != SPLIT_VALIDATION:
+            skipped["split"] += 1
+            continue
+        if str(row.get("duplicate_target", "")).strip() == "yes":
+            skipped["duplicate"] += 1
+            continue
+        instruction = str(row.get("instruction") or "")
+        made = make_pair(instruction)
+        if made is None:
+            skipped["pair"] += 1
+            continue
+        term, _ = made
+        neutral = strip_spatial_term(instruction, term)
+        if not neutral:
+            skipped["strip"] += 1
+            continue
+        noun = extract_target_noun(instruction)
+        if not noun:
+            skipped["noun"] += 1
+            continue
+        item = dict(row)
+        item["spatial_term"] = term
+        item["instr_neutral"] = neutral
+        item["noun"] = noun
+        out.append(item)
+    return {"rows": out, "skipped": skipped, "n": len(out)}
+
+
+def _tracking_rate(flags) -> float:
+    """Mean of a boolean sequence, or NaN when nothing was decided."""
+    values = np.asarray(list(flags), dtype=float)
+    if values.size == 0:
+        return float("nan")
+    return float(np.mean(values))
+
+
+def _side_summary(rows) -> dict:
+    """Toward-object and flip rates for one object-side stratum."""
+    n = len(rows)
+    if n == 0:
+        return {
+            "n": 0,
+            "n_undecided_original": 0,
+            "n_undecided_mirror": 0,
+            "toward_original": float("nan"),
+            "toward_mirror": float("nan"),
+            "flip_rate": float("nan"),
+        }
+    orig = [r["toward_original"] for r in rows]
+    mir = [r["toward_mirror"] for r in rows]
+    decided_orig = [v for v in orig if v is not None]
+    decided_mir = [v for v in mir if v is not None]
+    flips = [r["flip"] for r in rows if r["flip"] is not None]
+    return {
+        "n": n,
+        "n_undecided_original": int(sum(v is None for v in orig)),
+        "n_undecided_mirror": int(sum(v is None for v in mir)),
+        "toward_original": _tracking_rate(decided_orig),
+        "toward_mirror": _tracking_rate(decided_mir),
+        "flip_rate": _tracking_rate(flips),
+    }
+
+
+def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
+                           continuous: bool = True, min_magnitude: float = 0.0,
+                           lateral_sign: int = 1,
+                           original_condition: str = TRACKING_CONDITION_ORIGINAL,
+                           mirror_condition: str = TRACKING_CONDITION_MIRROR,
+                           ) -> dict:
+    """Does the first action track a unique object and reverse under a mirror?
+
+    `predictions` carries one row per (scene, condition) with the lateral value
+    in `c0` or `a0`. `geometry` carries `x_object`, `x_gripper`, and
+    `image_width` per `scene_id`. The mirrored object and gripper positions are
+    computed from those three columns; they are not stored separately.
+
+    Rates are reported overall and split by the object's side of the gripper.
+    The split is load-bearing: a pooled toward-object rate can look like tracking
+    when objects sit mostly on one side and the model has a fixed directional
+    prior. An image-left prior is high on the left, near chance or below on the
+    right, and does not reverse under the mirror.
+
+    Undecided predictions (sub-bin, or an object on the gripper's column) are
+    excluded from each rate and counted separately.
+    """
+    empty = {
+        "n": 0, "n_undecided_original": 0, "n_undecided_mirror": 0,
+        "min_magnitude": float(min_magnitude), "lateral_sign": int(lateral_sign),
+        "toward_original": float("nan"), "toward_mirror": float("nan"),
+        "flip_rate": float("nan"), "identical_rate": float("nan"),
+        "by_object_side": {OBJECT_SIDE_LEFT: _side_summary([]),
+                           OBJECT_SIDE_RIGHT: _side_summary([])},
+    }
+    if predictions is None or predictions.empty or geometry is None or geometry.empty:
+        return empty
+    if "scene_id" not in predictions.columns or "scene_id" not in geometry.columns:
+        return empty
+
+    value_col = "c0" if continuous else "a0"
+    if value_col not in predictions.columns:
+        value_col = "a0" if "a0" in predictions.columns else None
+    if value_col is None:
+        return empty
+
+    needed = {"x_object", "x_gripper", "image_width"}
+    if not needed <= set(geometry.columns):
+        return {**empty, "note": f"{sorted(needed)} were not recorded"}
+
+    orig = predictions[predictions["condition"] == original_condition]
+    mir = predictions[predictions["condition"] == mirror_condition]
+    if orig.empty or mir.empty:
+        return empty
+
+    orig_val = orig.groupby("scene_id")[value_col].mean()
+    mir_val = mir.groupby("scene_id")[value_col].mean()
+    geo = geometry.drop_duplicates(subset="scene_id").set_index("scene_id")
+
+    scored = []
+    for scene_id in orig_val.index.intersection(mir_val.index).intersection(geo.index):
+        row = geo.loc[scene_id]
+        x_object = float(row["x_object"])
+        x_gripper = float(row["x_gripper"])
+        width = float(row["image_width"])
+        side = object_side_image(x_object, x_gripper)
+        if side == 0:
+            continue
+        dx_orig = float(orig_val.loc[scene_id])
+        dx_mir = float(mir_val.loc[scene_id])
+        toward_orig = toward_object(
+            dx_orig, x_object, x_gripper,
+            min_magnitude=min_magnitude, lateral_sign=lateral_sign)
+        toward_mir = toward_object(
+            dx_mir, mirrored_x(x_object, width), mirrored_x(x_gripper, width),
+            min_magnitude=min_magnitude, lateral_sign=lateral_sign)
+        orig_decided = bool(_decided([dx_orig], min_magnitude)[0])
+        mir_decided = bool(_decided([dx_mir], min_magnitude)[0])
+        flip = None
+        if orig_decided and mir_decided:
+            flip = bool(dx_orig * dx_mir < 0)
+        scored.append({
+            "scene_id": scene_id,
+            "side": OBJECT_SIDE_LEFT if side < 0 else OBJECT_SIDE_RIGHT,
+            "toward_original": toward_orig,
+            "toward_mirror": toward_mir,
+            "flip": flip,
+            "identical": bool(dx_orig == dx_mir) if orig_decided and mir_decided else None,
+        })
+
+    if not scored:
+        return empty
+
+    by_side = {
+        OBJECT_SIDE_LEFT: _side_summary([r for r in scored if r["side"] == OBJECT_SIDE_LEFT]),
+        OBJECT_SIDE_RIGHT: _side_summary([r for r in scored if r["side"] == OBJECT_SIDE_RIGHT]),
+    }
+    overall = _side_summary(scored)
+    identical = [r["identical"] for r in scored if r["identical"] is not None]
+    return {
+        "n": overall["n"],
+        "n_undecided_original": overall["n_undecided_original"],
+        "n_undecided_mirror": overall["n_undecided_mirror"],
+        "min_magnitude": float(min_magnitude),
+        "lateral_sign": int(lateral_sign),
+        "toward_original": overall["toward_original"],
+        "toward_mirror": overall["toward_mirror"],
+        "flip_rate": overall["flip_rate"],
+        "identical_rate": _tracking_rate(identical),
+        "by_object_side": by_side,
+    }
+
+
+def object_tracking_gate(report, *, min_toward: float = 0.7,
+                         min_flip: float = 0.5, min_n_per_side: int = 10) -> dict:
+    """Pass/fail for the first-action object-tracking instrument check.
+
+    Passes only when toward-object holds on both sides of the gripper, on both
+    the original and the mirrored frame, the action reverses under the mirror,
+    and each side has enough scenes that a rate is not a handful of draws. A
+    pooled rate is not sufficient: that is how an image-left prior masquerades
+    as tracking.
+    """
+    reasons = []
+    sides = report.get("by_object_side") or {}
+    for name in (OBJECT_SIDE_LEFT, OBJECT_SIDE_RIGHT):
+        side = sides.get(name) or {}
+        n = int(side.get("n") or 0)
+        n_decided = n - int(side.get("n_undecided_original") or 0)
+        if n_decided < min_n_per_side:
+            reasons.append(
+                f"{name}: {n_decided} decided scenes, below the "
+                f"{min_n_per_side} this check requires")
+            continue
+        for key, label in (("toward_original", "original toward-object"),
+                           ("toward_mirror", "mirrored toward-object"),
+                           ("flip_rate", "flip rate")):
+            rate = side.get(key, float("nan"))
+            floor = min_flip if key == "flip_rate" else min_toward
+            if not (np.isfinite(rate) and rate >= floor):
+                shown = f"{rate:.1%}" if np.isfinite(rate) else "undefined"
+                reasons.append(f"{name} {label} {shown}, below {floor:.0%}")
+    overall_flip = report.get("flip_rate", float("nan"))
+    if not (np.isfinite(overall_flip) and overall_flip >= min_flip):
+        shown = f"{overall_flip:.1%}" if np.isfinite(overall_flip) else "undefined"
+        reasons.append(f"overall flip rate {shown}, below {min_flip:.0%}")
+    return {
+        "pass": not reasons,
+        "reasons": reasons,
+        "min_toward": float(min_toward),
+        "min_flip": float(min_flip),
+        "min_n_per_side": int(min_n_per_side),
+        "n": int(report.get("n") or 0),
     }

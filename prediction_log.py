@@ -88,6 +88,20 @@ def probe_log_fields() -> list[str]:
     return canonical_log_fields(PROBE_EXTRA_FIELDS)
 
 
+# Extra keys for the first-action object-tracking log, written by Notebook 04.
+# A separate file from the probe log: that log is the language experiment, this
+# one is the instrument check that licenses reading it.
+TRACKING_EXTRA_FIELDS = (
+    "scene_id", "episode_index", "role", "condition", "image_transform",
+    "noun", "spatial_term", "sample_idx",
+)
+
+
+def tracking_log_fields() -> list[str]:
+    """Full column order of the object-tracking instrument-check log."""
+    return canonical_log_fields(TRACKING_EXTRA_FIELDS)
+
+
 def widen_log(csv_path: str, extra_fields, verbose: bool = False) -> list[str]:
     """Rewrite `csv_path` with `extra_fields` appended to its header.
 
