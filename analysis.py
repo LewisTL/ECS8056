@@ -100,6 +100,11 @@ TRACKING_SET_FIELDS = (
 
 TRACKING_INSTRUCTION = "pick up the {noun}"
 
+# Harvested early-motion translation, summed over the first five non-initial
+# Bridge steps after skipping the recorded no-op. Same layout order as OpenVLA
+# dx, dy, dz, but a multi-step demonstration vector, not one predicted token.
+GT_TRANSLATION_COLS = ("gt_dx", "gt_dy", "gt_dz")
+
 
 def value_column(axis_index: int, continuous: bool = True) -> str:
     """Name of the column holding one translation component."""
@@ -900,11 +905,85 @@ def _side_summary(rows) -> dict:
     }
 
 
+def _as_float(value) -> float:
+    """Parse a CSV cell to float, or NaN when empty or unreadable."""
+    if value is None:
+        return float("nan")
+    text = str(value).strip()
+    if not text or text.lower() in {"nan", "none"}:
+        return float("nan")
+    try:
+        return float(text)
+    except ValueError:
+        return float("nan")
+
+
+def attach_tracking_ground_truth(geometry, manifest) -> pd.DataFrame:
+    """Copy harvested early-motion `gt_dx`, `gt_dy`, `gt_dz` onto tracking geometry.
+
+    The join is `episode_index`. Ground truth is the net Bridge action over the
+    first five non-initial steps, not a single OpenVLA token and not a mirrored
+    trial. Rows with no readable vector keep NaN in those columns.
+    """
+    geo = pd.DataFrame(geometry).copy()
+    geo = geo.drop(columns=[c for c in GT_TRANSLATION_COLS if c in geo.columns],
+                   errors="ignore")
+    if geo.empty or "episode_index" not in geo.columns:
+        for col in GT_TRANSLATION_COLS:
+            geo[col] = float("nan")
+        return geo
+    man = pd.DataFrame(manifest)
+    if man.empty or "episode_index" not in man.columns:
+        for col in GT_TRANSLATION_COLS:
+            if col not in geo.columns:
+                geo[col] = float("nan")
+        return geo
+    man = man.copy()
+    man["_ep"] = man["episode_index"].map(lambda v: str(v).strip())
+    keep = ["_ep"]
+    for col in GT_TRANSLATION_COLS:
+        if col in man.columns:
+            keep.append(col)
+    man = man[keep].drop_duplicates(subset="_ep")
+    geo["_ep"] = geo["episode_index"].map(lambda v: str(v).strip())
+    merged = geo.merge(man, on="_ep", how="left")
+    for col in GT_TRANSLATION_COLS:
+        if col not in merged.columns:
+            merged[col] = float("nan")
+        else:
+            merged[col] = merged[col].map(_as_float)
+    return merged.drop(columns=["_ep"], errors="ignore")
+
+
+def tracking_gt_predictions(geometry: pd.DataFrame) -> pd.DataFrame:
+    """Original-condition log whose `c0`, `c1`, `c2` are harvested `gt_*`.
+
+    One row per scene. There is no mirrored demonstration, so the tracking
+    report must be called with `require_mirror=False`.
+    """
+    geo = pd.DataFrame(geometry)
+    rows = []
+    for _, row in geo.iterrows():
+        values = [_as_float(row.get(col)) for col in GT_TRANSLATION_COLS]
+        if not any(np.isfinite(v) for v in values):
+            continue
+        item = {
+            "scene_id": row["scene_id"],
+            "condition": TRACKING_CONDITION_ORIGINAL,
+        }
+        for i, value in enumerate(values):
+            item[f"c{i}"] = value
+            item[f"a{i}"] = value
+        rows.append(item)
+    return pd.DataFrame(rows)
+
+
 def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
                            continuous: bool = True, min_magnitude: float = 0.0,
                            lateral_sign: int = 1, axis_index: int = 0,
                            original_condition: str = TRACKING_CONDITION_ORIGINAL,
                            mirror_condition: str = TRACKING_CONDITION_MIRROR,
+                           require_mirror: bool = True,
                            ) -> dict:
     """Does one translation component track a unique object under a mirror?
 
@@ -928,6 +1007,9 @@ def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
     Rates are reported overall and split by the object's side of the gripper.
     Undecided predictions (sub-bin, or an object on the gripper's column) are
     excluded from each rate and counted separately.
+
+    Demonstration ground truth has no mirrored trial. Pass `require_mirror=False`
+    to score the original frame only; toward-mirror and flip are then undefined.
     """
     empty = {
         "n": 0, "n_undecided_original": 0, "n_undecided_mirror": 0,
@@ -938,6 +1020,7 @@ def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
         "negative_rate_original": float("nan"),
         "negative_rate_mirror": float("nan"),
         "mean_original": float("nan"), "mean_mirror": float("nan"),
+        "require_mirror": bool(require_mirror),
         "by_object_side": {OBJECT_SIDE_LEFT: _side_summary([]),
                            OBJECT_SIDE_RIGHT: _side_summary([])},
     }
@@ -959,16 +1042,23 @@ def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
         return {**empty, "note": f"{sorted(needed)} were not recorded"}
 
     orig = predictions[predictions["condition"] == original_condition]
-    mir = predictions[predictions["condition"] == mirror_condition]
-    if orig.empty or mir.empty:
+    orig = orig[orig[value_col].notna()]
+    if orig.empty:
         return empty
-
     orig_val = orig.groupby("scene_id")[value_col].mean()
-    mir_val = mir.groupby("scene_id")[value_col].mean()
     geo = geometry.drop_duplicates(subset="scene_id").set_index("scene_id")
+    scene_ids = orig_val.index.intersection(geo.index)
+    mir_val = None
+    if require_mirror:
+        mir = predictions[predictions["condition"] == mirror_condition]
+        mir = mir[mir[value_col].notna()]
+        if mir.empty:
+            return empty
+        mir_val = mir.groupby("scene_id")[value_col].mean()
+        scene_ids = scene_ids.intersection(mir_val.index)
 
     scored = []
-    for scene_id in orig_val.index.intersection(mir_val.index).intersection(geo.index):
+    for scene_id in scene_ids:
         row = geo.loc[scene_id]
         x_object = float(row["x_object"])
         x_gripper = float(row["x_gripper"])
@@ -977,25 +1067,37 @@ def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
         if side == 0:
             continue
         dx_orig = float(orig_val.loc[scene_id])
-        dx_mir = float(mir_val.loc[scene_id])
+        if not np.isfinite(dx_orig):
+            continue
         toward_orig = toward_object(
             dx_orig, x_object, x_gripper,
             min_magnitude=min_magnitude, lateral_sign=lateral_sign)
-        toward_mir = toward_object(
-            dx_mir, mirrored_x(x_object, width), mirrored_x(x_gripper, width),
-            min_magnitude=min_magnitude, lateral_sign=lateral_sign)
         orig_decided = bool(_decided([dx_orig], min_magnitude)[0])
-        mir_decided = bool(_decided([dx_mir], min_magnitude)[0])
-        flip = None
-        if orig_decided and mir_decided:
-            flip = bool(dx_orig * dx_mir < 0)
+        if require_mirror:
+            dx_mir = float(mir_val.loc[scene_id])
+            if not np.isfinite(dx_mir):
+                continue
+            toward_mir = toward_object(
+                dx_mir, mirrored_x(x_object, width), mirrored_x(x_gripper, width),
+                min_magnitude=min_magnitude, lateral_sign=lateral_sign)
+            mir_decided = bool(_decided([dx_mir], min_magnitude)[0])
+            flip = None
+            if orig_decided and mir_decided:
+                flip = bool(dx_orig * dx_mir < 0)
+            identical = bool(dx_orig == dx_mir) if orig_decided and mir_decided else None
+        else:
+            dx_mir = float("nan")
+            toward_mir = None
+            mir_decided = False
+            flip = None
+            identical = None
         scored.append({
             "scene_id": scene_id,
             "side": OBJECT_SIDE_LEFT if side < 0 else OBJECT_SIDE_RIGHT,
             "toward_original": toward_orig,
             "toward_mirror": toward_mir,
             "flip": flip,
-            "identical": bool(dx_orig == dx_mir) if orig_decided and mir_decided else None,
+            "identical": identical,
             "value_original": dx_orig,
             "value_mirror": dx_mir,
             "decided_original": orig_decided,
@@ -1030,6 +1132,7 @@ def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
                           if orig_decided_vals else float("nan")),
         "mean_mirror": (float(np.mean(mir_decided_vals))
                         if mir_decided_vals else float("nan")),
+        "require_mirror": bool(require_mirror),
         "by_object_side": by_side,
     }
 
@@ -1039,6 +1142,7 @@ def object_tracking_by_axis(predictions: pd.DataFrame, geometry: pd.DataFrame, *
                             bin_widths=None, min_magnitude: float = 0.0,
                             original_condition: str = TRACKING_CONDITION_ORIGINAL,
                             mirror_condition: str = TRACKING_CONDITION_MIRROR,
+                            require_mirror: bool = True,
                             ) -> dict:
     """Score dx, dy, and dz as if each were the image-x channel.
 
@@ -1047,7 +1151,8 @@ def object_tracking_by_axis(predictions: pd.DataFrame, geometry: pd.DataFrame, *
     that keep one sign are not that channel. `bin_widths`, when given, is a
     sequence of per-component floors so dy and dz are not judged against the
     lateral bin width. The gate itself still reads dx; this scan is the check
-    that dx is the right component to have gated on.
+    that dx is the right component to have gated on. Pass `require_mirror=False`
+    for demonstration ground truth, which has no mirrored trial.
     """
     out = {}
     for axis in TRANSLATION_AXES:
@@ -1059,14 +1164,16 @@ def object_tracking_by_axis(predictions: pd.DataFrame, geometry: pd.DataFrame, *
             predictions, geometry, continuous=continuous, min_magnitude=mag,
             lateral_sign=lateral_sign, axis_index=axis,
             original_condition=original_condition,
-            mirror_condition=mirror_condition)
+            mirror_condition=mirror_condition,
+            require_mirror=require_mirror)
         report["name"] = TRANSLATION_AXIS_NAMES[axis]
         out[axis] = report
     return out
 
 
 def object_tracking_gate(report, *, min_toward: float = 0.7,
-                         min_flip: float = 0.5, min_n_per_side: int = 10) -> dict:
+                         min_flip: float = 0.5, min_n_per_side: int = 10,
+                         require_mirror: bool = True) -> dict:
     """Pass/fail for the first-action object-tracking instrument check.
 
     Passes only when toward-object holds on both sides of the gripper, on both
@@ -1074,6 +1181,9 @@ def object_tracking_gate(report, *, min_toward: float = 0.7,
     and each side has enough scenes that a rate is not a handful of draws. A
     pooled rate is not sufficient: that is how an image-left prior masquerades
     as tracking.
+
+    Demonstration ground truth has no mirrored trial. Pass `require_mirror=False`
+    to require toward-object on both sides of the original frame only.
     """
     reasons = []
     sides = report.get("by_object_side") or {}
@@ -1086,23 +1196,28 @@ def object_tracking_gate(report, *, min_toward: float = 0.7,
                 f"{name}: {n_decided} decided scenes, below the "
                 f"{min_n_per_side} this check requires")
             continue
-        for key, label in (("toward_original", "original toward-object"),
-                           ("toward_mirror", "mirrored toward-object"),
-                           ("flip_rate", "flip rate")):
+        checks = [("toward_original", "original toward-object", min_toward)]
+        if require_mirror:
+            checks.extend([
+                ("toward_mirror", "mirrored toward-object", min_toward),
+                ("flip_rate", "flip rate", min_flip),
+            ])
+        for key, label, floor in checks:
             rate = side.get(key, float("nan"))
-            floor = min_flip if key == "flip_rate" else min_toward
             if not (np.isfinite(rate) and rate >= floor):
                 shown = f"{rate:.1%}" if np.isfinite(rate) else "undefined"
                 reasons.append(f"{name} {label} {shown}, below {floor:.0%}")
-    overall_flip = report.get("flip_rate", float("nan"))
-    if not (np.isfinite(overall_flip) and overall_flip >= min_flip):
-        shown = f"{overall_flip:.1%}" if np.isfinite(overall_flip) else "undefined"
-        reasons.append(f"overall flip rate {shown}, below {min_flip:.0%}")
+    if require_mirror:
+        overall_flip = report.get("flip_rate", float("nan"))
+        if not (np.isfinite(overall_flip) and overall_flip >= min_flip):
+            shown = f"{overall_flip:.1%}" if np.isfinite(overall_flip) else "undefined"
+            reasons.append(f"overall flip rate {shown}, below {min_flip:.0%}")
     return {
         "pass": not reasons,
         "reasons": reasons,
         "min_toward": float(min_toward),
-        "min_flip": float(min_flip),
+        "min_flip": float(min_flip) if require_mirror else float("nan"),
         "min_n_per_side": int(min_n_per_side),
+        "require_mirror": bool(require_mirror),
         "n": int(report.get("n") or 0),
     }
