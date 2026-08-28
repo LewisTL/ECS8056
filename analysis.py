@@ -16,12 +16,14 @@ pattern across them rather than on any single test:
     behaviour on the same image with the term removed.
   * `congruence_test` asks whether the term's effect tracks the recorded geometry
     or a fixed word-to-direction mapping, which is the decisive contrast.
-  * `object_tracking_report` asks whether the first predicted action moves toward
+    * `object_tracking_report` asks whether the first predicted action moves toward
     a unique named object and reverses when that object's image position reverses.
     That is the instrument check the language tests rest on: a first-step miss
     toward a named referent is evidence of a spatial-language failure only when
     this check has already shown that the first action is an object-directed
-    readout.
+    readout. `object_tracking_by_axis` repeats the scoring on dx, dy, and dz, so
+    a fail on dx can be read as a dead visual channel or as the image-x signal
+    sitting on another translation component.
 
 Four conventions apply throughout.
 
@@ -72,6 +74,11 @@ LATERAL_TERM_IMAGE_SIGN = {"left": -1, "leftmost": -1, "right": 1, "rightmost": 
 # in the frame, matching the constructed-set geometry convention.
 OBJECT_SIDE_LEFT = "left"
 OBJECT_SIDE_RIGHT = "right"
+
+# Translation components, in OpenVLA layout order. Index 0 is treated as lateral
+# until a horizontal image flip shows which component actually reverses.
+TRANSLATION_AXIS_NAMES = {0: "dx", 1: "dy", 2: "dz"}
+TRANSLATION_AXES = tuple(TRANSLATION_AXIS_NAMES)
 
 # Conditions the object-tracking gate predicts: the term-stripped instruction on
 # the original frame and on its horizontal mirror. Names match the probe factorial
@@ -860,31 +867,42 @@ def _side_summary(rows) -> dict:
 
 def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
                            continuous: bool = True, min_magnitude: float = 0.0,
-                           lateral_sign: int = 1,
+                           lateral_sign: int = 1, axis_index: int = 0,
                            original_condition: str = TRACKING_CONDITION_ORIGINAL,
                            mirror_condition: str = TRACKING_CONDITION_MIRROR,
                            ) -> dict:
-    """Does the first action track a unique object and reverse under a mirror?
+    """Does one translation component track a unique object under a mirror?
 
-    `predictions` carries one row per (scene, condition) with the lateral value
-    in `c0` or `a0`. `geometry` carries `x_object`, `x_gripper`, and
-    `image_width` per `scene_id`. The mirrored object and gripper positions are
-    computed from those three columns; they are not stored separately.
+    `axis_index` selects `c0`/`a0` (dx), `c1`/`a1` (dy), or `c2`/`a2` (dz). The
+    default is dx, which `TERM_AXIS` treats as lateral. Scoring dy or dz the same
+    way asks whether that component behaves as the image-x channel: a horizontal
+    flip reverses image x, so the true lateral component must reverse and must
+    point at the object on both sides of the gripper.
+
+    A component that keeps one sign on the original and mirrored frames is not
+    that channel. Scoring it as lateral produces a high toward-object rate when
+    the object sits left of the gripper and a low rate when it sits right, which
+    is indistinguishable from an image-left prior. The fraction of negative
+    decided values on each frame is reported so that pattern can be read as a
+    constant sign rather than as tracking.
+
+    `predictions` carries one row per (scene, condition). `geometry` carries
+    `x_object`, `x_gripper`, and `image_width` per `scene_id`. The mirrored
+    object and gripper positions are computed from those three columns.
 
     Rates are reported overall and split by the object's side of the gripper.
-    The split is load-bearing: a pooled toward-object rate can look like tracking
-    when objects sit mostly on one side and the model has a fixed directional
-    prior. An image-left prior is high on the left, near chance or below on the
-    right, and does not reverse under the mirror.
-
     Undecided predictions (sub-bin, or an object on the gripper's column) are
     excluded from each rate and counted separately.
     """
     empty = {
         "n": 0, "n_undecided_original": 0, "n_undecided_mirror": 0,
         "min_magnitude": float(min_magnitude), "lateral_sign": int(lateral_sign),
+        "axis_index": int(axis_index),
         "toward_original": float("nan"), "toward_mirror": float("nan"),
         "flip_rate": float("nan"), "identical_rate": float("nan"),
+        "negative_rate_original": float("nan"),
+        "negative_rate_mirror": float("nan"),
+        "mean_original": float("nan"), "mean_mirror": float("nan"),
         "by_object_side": {OBJECT_SIDE_LEFT: _side_summary([]),
                            OBJECT_SIDE_RIGHT: _side_summary([])},
     }
@@ -893,9 +911,11 @@ def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
     if "scene_id" not in predictions.columns or "scene_id" not in geometry.columns:
         return empty
 
-    value_col = "c0" if continuous else "a0"
+    stem = "c" if continuous else "a"
+    value_col = f"{stem}{int(axis_index)}"
     if value_col not in predictions.columns:
-        value_col = "a0" if "a0" in predictions.columns else None
+        alt = f"a{int(axis_index)}" if continuous else f"c{int(axis_index)}"
+        value_col = alt if alt in predictions.columns else None
     if value_col is None:
         return empty
 
@@ -941,6 +961,10 @@ def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
             "toward_mirror": toward_mir,
             "flip": flip,
             "identical": bool(dx_orig == dx_mir) if orig_decided and mir_decided else None,
+            "value_original": dx_orig,
+            "value_mirror": dx_mir,
+            "decided_original": orig_decided,
+            "decided_mirror": mir_decided,
         })
 
     if not scored:
@@ -952,18 +976,58 @@ def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
     }
     overall = _side_summary(scored)
     identical = [r["identical"] for r in scored if r["identical"] is not None]
+    orig_decided_vals = [r["value_original"] for r in scored if r["decided_original"]]
+    mir_decided_vals = [r["value_mirror"] for r in scored if r["decided_mirror"]]
     return {
         "n": overall["n"],
         "n_undecided_original": overall["n_undecided_original"],
         "n_undecided_mirror": overall["n_undecided_mirror"],
         "min_magnitude": float(min_magnitude),
         "lateral_sign": int(lateral_sign),
+        "axis_index": int(axis_index),
         "toward_original": overall["toward_original"],
         "toward_mirror": overall["toward_mirror"],
         "flip_rate": overall["flip_rate"],
         "identical_rate": _tracking_rate(identical),
+        "negative_rate_original": _tracking_rate(v < 0 for v in orig_decided_vals),
+        "negative_rate_mirror": _tracking_rate(v < 0 for v in mir_decided_vals),
+        "mean_original": (float(np.mean(orig_decided_vals))
+                          if orig_decided_vals else float("nan")),
+        "mean_mirror": (float(np.mean(mir_decided_vals))
+                        if mir_decided_vals else float("nan")),
         "by_object_side": by_side,
     }
+
+
+def object_tracking_by_axis(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
+                            continuous: bool = True, lateral_sign: int = 1,
+                            bin_widths=None, min_magnitude: float = 0.0,
+                            original_condition: str = TRACKING_CONDITION_ORIGINAL,
+                            mirror_condition: str = TRACKING_CONDITION_MIRROR,
+                            ) -> dict:
+    """Score dx, dy, and dz as if each were the image-x channel.
+
+    A horizontal flip reverses image x. The component that is lateral must
+    reverse and must track the object on both sides of the gripper. Components
+    that keep one sign are not that channel. `bin_widths`, when given, is a
+    sequence of per-component floors so dy and dz are not judged against the
+    lateral bin width. The gate itself still reads dx; this scan is the check
+    that dx is the right component to have gated on.
+    """
+    out = {}
+    for axis in TRANSLATION_AXES:
+        if bin_widths is not None:
+            mag = float(bin_widths[axis])
+        else:
+            mag = float(min_magnitude)
+        report = object_tracking_report(
+            predictions, geometry, continuous=continuous, min_magnitude=mag,
+            lateral_sign=lateral_sign, axis_index=axis,
+            original_condition=original_condition,
+            mirror_condition=mirror_condition)
+        report["name"] = TRANSLATION_AXIS_NAMES[axis]
+        out[axis] = report
+    return out
 
 
 def object_tracking_gate(report, *, min_toward: float = 0.7,
