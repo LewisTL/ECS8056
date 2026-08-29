@@ -1287,7 +1287,7 @@ def aggregate_multistep(readouts, method: str = "sum") -> dict:
     a_sums = [0.0, 0.0, 0.0]
     for r in readouts:
         for i in range(3):
-            c_sums[i] += float(r.continuous[i])
+            c_sums[i] += float(r.expected[i])
             a_sums[i] += float(r.action[i])
 
     if method == "mean":
