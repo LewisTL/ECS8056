@@ -1254,3 +1254,99 @@ def object_tracking_gate(report, *, min_toward: float = 0.7,
         "require_mirror": bool(require_mirror),
         "n": int(report.get("n") or 0),
     }
+
+
+# --------------------------------------------------------------------------- #
+# Multi-step open-loop aggregation
+# --------------------------------------------------------------------------- #
+MULTISTEP_CONDITION_ORIGINAL = "multistep_neutral"
+MULTISTEP_CONDITION_MIRROR = "multistep_mirror_neutral"
+
+# Default number of steps to aggregate, matching the ground-truth window.
+DEFAULT_N_STEPS = 5
+
+
+def aggregate_multistep(readouts, method: str = "sum") -> dict:
+    """Aggregate translation components across multiple action readouts.
+
+    Each readout is an `ActionReadout` from `predict_action_dist`. The returned
+    dict has `c0`, `c1`, `c2` (aggregated continuous values), `a0`, `a1`, `a2`
+    (aggregated argmax values), and `n_steps`.
+
+    `method` is one of:
+      - "sum": net displacement, matching the ground-truth definition.
+      - "mean": average per step, useful for comparing windows of different lengths.
+    """
+    if not readouts:
+        return {"n_steps": 0}
+    if method not in ("sum", "mean"):
+        raise ValueError(f"method must be 'sum' or 'mean', got {method!r}")
+
+    n = len(readouts)
+    c_sums = [0.0, 0.0, 0.0]
+    a_sums = [0.0, 0.0, 0.0]
+    for r in readouts:
+        for i in range(3):
+            c_sums[i] += float(r.continuous[i])
+            a_sums[i] += float(r.action[i])
+
+    if method == "mean":
+        c_sums = [v / n for v in c_sums]
+        a_sums = [v / n for v in a_sums]
+
+    return {
+        "n_steps": n,
+        "method": method,
+        **{f"c{i}": c_sums[i] for i in range(3)},
+        **{f"a{i}": a_sums[i] for i in range(3)},
+    }
+
+
+def multistep_tracking_predictions(
+    scene_aggregates: list[dict],
+    original_condition: str = MULTISTEP_CONDITION_ORIGINAL,
+    mirror_condition: str = MULTISTEP_CONDITION_MIRROR,
+) -> pd.DataFrame:
+    """Build a predictions DataFrame from aggregated multi-step results.
+
+    Each entry in `scene_aggregates` is a dict with:
+      - scene_id
+      - condition (original_condition or mirror_condition)
+      - c0, c1, c2 (aggregated continuous values)
+      - a0, a1, a2 (aggregated argmax values)
+      - n_steps
+
+    The returned DataFrame has the same schema as single-step tracking predictions,
+    so it can be passed to `object_tracking_report` and `object_tracking_by_axis`.
+    """
+    rows = []
+    for agg in scene_aggregates:
+        row = {
+            "scene_id": agg["scene_id"],
+            "condition": agg["condition"],
+            "n_steps": agg.get("n_steps", 0),
+            "method": agg.get("method", "sum"),
+        }
+        for i in range(3):
+            row[f"c{i}"] = agg.get(f"c{i}", float("nan"))
+            row[f"a{i}"] = agg.get(f"a{i}", float("nan"))
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def multistep_tracking_log_fields() -> list[str]:
+    """Column names for the multi-step tracking log.
+
+    Extends the single-step log with `n_steps` and `method`, and stores the
+    per-step continuous values as `step_0_c0`, `step_0_c1`, etc.
+    """
+    base = [
+        "timestamp", "scene_id", "episode_index", "condition", "image_transform",
+        "instruction", "noun", "spatial_term", "n_steps", "method",
+    ]
+    aggregated = [f"c{i}" for i in range(3)] + [f"a{i}" for i in range(3)]
+    per_step = []
+    for step in range(DEFAULT_N_STEPS):
+        for i in range(7):
+            per_step.append(f"step_{step}_c{i}")
+    return base + aggregated + per_step
