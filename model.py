@@ -311,38 +311,6 @@ def predict_action_dist(
     )
 
 
-@torch.inference_mode()
-def predict_multistep(
-    processor,
-    vla,
-    image: Image.Image,
-    instruction: str,
-    n_steps: int = 5,
-    compute_dtype: torch.dtype = torch.bfloat16,
-    unnorm_key: str = DEFAULT_UNNORM_KEY,
-) -> list[ActionReadout]:
-    """Predict multiple action steps from a single frozen frame.
-
-    Each step is a fresh forward pass conditioned on the same image and
-    instruction. The model receives no feedback from its own predictions: this
-    is open-loop multi-step prediction, not closed-loop rollout. The returned
-    list has `n_steps` entries, each an `ActionReadout` from `predict_action_dist`.
-
-    The use case is comparing the model's short-horizon trajectory estimate with
-    the harvested demonstration, which is itself a multi-step sum. A single-step
-    prediction may not track the object even when the cumulative early output does.
-    """
-    if n_steps < 1:
-        raise ValueError(f"n_steps must be at least 1, got {n_steps}")
-    readouts = []
-    for _ in range(n_steps):
-        readout = predict_action_dist(
-            processor, vla, image, instruction, compute_dtype, unnorm_key
-        )
-        readouts.append(readout)
-    return readouts
-
-
 def verify_readout(
     processor,
     vla,
