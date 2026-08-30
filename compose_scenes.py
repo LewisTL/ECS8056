@@ -1627,6 +1627,70 @@ def apply_validation_labels(out_dir: str) -> dict:
             "configuration_disagreements": disagreements}
 
 
+# The annotator's answer when the arrangement cannot be read from the image.
+# A scene carrying it has no trustworthy arrangement under either account, so
+# the probe excludes it rather than testing it under a label nobody stands
+# behind.
+ARRANGEMENT_UNCLEAR = "unclear"
+
+
+def arrangement_target_signs(configuration: str, expected_sign_image: int):
+    """The side each instruction's target sits on, implied by an arrangement.
+
+    The two same-side arrangements fix both signs outright. The opposite
+    arrangement puts the two targets either side of the start position, so the
+    signs follow from which named target is further right, which is
+    `expected_sign_image`: pure instance geometry, exact by construction and
+    independent of where the gripper was detected.
+    """
+    if configuration == CONFIG_SAME_LEFT:
+        return -1, -1
+    if configuration == CONFIG_SAME_RIGHT:
+        return 1, 1
+    if configuration == CONFIG_OPPOSITE:
+        sign = int(expected_sign_image)
+        return sign, -sign
+    raise ValueError(f"unknown configuration {configuration!r}")
+
+
+def resolve_scene_arrangement(scene) -> dict | None:
+    """The arrangement a scene is probed under, once the hand labels are in.
+
+    Returns `None` for a scene whose hand label is `unclear`, which the probe
+    set drops. A scene without a hand label, or whose label agrees with the
+    recorded arrangement, keeps its recorded configuration and target signs
+    unchanged. A scene whose label disagrees is probed under the human
+    reading: the arrangement is defined relative to the real arm, and the
+    annotator saw the arm where the detector may not have, so the recorded
+    configuration and the gripper-relative signs are the columns the
+    disagreement discredits. The target signs are re-derived from the human
+    arrangement and the instances' relative order (`expected_sign_image`),
+    which is exact by construction and does not rest on the gripper
+    detection. The recorded geometry columns in the manifest are not touched;
+    the correction is applied where the scene is read.
+    """
+    row = asdict(scene) if isinstance(scene, ConstructedScene) else dict(scene)
+    label = str(row.get("human_configuration", "") or "")
+    recorded = str(row["configuration"])
+    if label == ARRANGEMENT_UNCLEAR:
+        return None
+    if not label or label == recorded:
+        return {
+            "configuration": recorded,
+            "target_sign_a_image": int(row["target_sign_a_image"]),
+            "target_sign_b_image": int(row["target_sign_b_image"]),
+            "relabelled": False,
+        }
+    sign_a, sign_b = arrangement_target_signs(
+        label, int(row["expected_sign_image"]))
+    return {
+        "configuration": label,
+        "target_sign_a_image": sign_a,
+        "target_sign_b_image": sign_b,
+        "relabelled": True,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Approval review
 # --------------------------------------------------------------------------- #
