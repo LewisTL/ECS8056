@@ -88,7 +88,7 @@ def probe_log_fields() -> list[str]:
     return canonical_log_fields(PROBE_EXTRA_FIELDS)
 
 
-# Extra keys for the first-action object-tracking log, written by Notebook 04.
+# Extra keys for the first-action object-tracking log, written by Notebook 03.
 # A separate file from the probe log: that log is the language experiment, this
 # one is the instrument check that licenses reading it.
 TRACKING_EXTRA_FIELDS = (

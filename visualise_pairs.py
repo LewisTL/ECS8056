@@ -175,14 +175,19 @@ def main():
         png = os.path.join(out_dir, f"{p['pair_id']}.png")
         Image.fromarray(rgba[..., :3].astype(np.uint8)).save(png)
 
-        dxa, dxb = p["action_a"][0], p["action_b"][0]
-        flip = dxa * dxb < 0
-        print(f"[{i + 1}/{len(pairs)}] {p['pair_id']}  dx_a={dxa:+.4f} "
-              f"dx_b={dxb:+.4f}  x-flip={'YES' if flip else 'no'}  -> {png}")
+        # The flip diagnostic reads the pair's own expected component. The
+        # identified lateral channel is component 1, so that is the fallback
+        # for records written before axis_index was carried through.
+        axis = int(p.get("axis_index") or 1)
+        lat_a, lat_b = p["action_a"][axis], p["action_b"][axis]
+        flip = lat_a * lat_b < 0
+        print(f"[{i + 1}/{len(pairs)}] {p['pair_id']}  lateral_a={lat_a:+.4f} "
+              f"lateral_b={lat_b:+.4f}  flip={'YES' if flip else 'no'}  -> {png}")
         index_rows.append({
             "pair_id": p["pair_id"], "scene_id": p["scene_id"],
             "instr_a": p["instr_a"], "instr_b": p["instr_b"],
-            "dx_a": dxa, "dx_b": dxb, "x_sign_flip": flip,
+            "axis_index": axis, "lateral_a": lat_a, "lateral_b": lat_b,
+            "lateral_sign_flip": flip,
             "pred_display_scale": round(scale_pred, 2),
             "gt_display_scale": round(scale_gt, 2),
             "image": os.path.basename(png)})

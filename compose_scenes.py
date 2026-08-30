@@ -67,32 +67,35 @@ from data import (CATEGORY_REFERENT, SPLIT_CONSTRUCTION, is_lateral_term,
 from detect_duplicates import DEFAULT_SCORE_THRESH
 
 # Sign relating image x to the lateral action component: +1 if a target further
-# right in the image implies a larger dx. Identity until the mirror control
-# establishes it, following the convention already used for `BRIDGE_TO_ISAAC`.
+# right in the image implies a larger value on that component. The axis
+# identification scored every component under both signs against scene geometry,
+# on the demonstration ground truth and on the model, and fixed the lateral
+# channel at component 1 (dy in the OpenVLA layout naming) with this sign
+# inverted: a target further right in the image implies a more negative value.
 # The constructed manifest stores the expectation in image coordinates only, so
-# flipping this constant never requires regenerating scenes.
-IMAGE_X_TO_LATERAL_SIGN = 1
+# revising this constant never requires regenerating scenes.
+IMAGE_X_TO_LATERAL_SIGN = -1
 
-# Overlay of a robot-frame translation onto the camera image. Lateral (dx) maps
-# to image x through IMAGE_X_TO_LATERAL_SIGN. Depth (dy) recedes down the image
-# because the arm enters from the top, so away-from-robot is toward the bottom.
-# Vertical (dz) points up the image. A small depth shear into image x keeps a
-# pure-depth prediction distinct from a pure-vertical one.
-DEPTH_TO_IMAGE_X = 0.35
-DEPTH_TO_IMAGE_Y = 1.0
-VERTICAL_TO_IMAGE_Y = -1.0
+# Index of the identified lateral channel in the action translation. The layout
+# naming (dx, dy, dz) does not describe image geometry; only this component has
+# an established image reading, so overlays draw it alone rather than dressing
+# the other two components in a geometry nothing has verified.
+LATERAL_ACTION_INDEX = 1
 
 
-def action_image_delta(dx, dy, dz, *, scale: float = 1.0,
+def action_image_delta(c0, c1, c2, *, scale: float = 1.0,
                        lateral_sign: int = IMAGE_X_TO_LATERAL_SIGN):
-    """Map a robot-frame translation onto image-pixel offsets.
+    """Map a predicted translation onto image-pixel offsets.
 
-    `dx` is lateral, `dy` is depth (away from the robot base), `dz` is vertical.
-    Returns `(pixel_x, pixel_y)` with image y increasing downward.
+    Only the identified lateral channel (component `LATERAL_ACTION_INDEX`) has
+    an established image reading, so it alone is projected, onto image x
+    through `lateral_sign`. The other two components have no identified image
+    direction and contribute nothing; an overlay drawn from this function is a
+    horizontal arrow. Returns `(pixel_x, pixel_y)` with image y increasing
+    downward.
     """
-    px = (float(dx) * lateral_sign + float(dy) * DEPTH_TO_IMAGE_X) * scale
-    py = (float(dy) * DEPTH_TO_IMAGE_Y + float(dz) * VERTICAL_TO_IMAGE_Y) * scale
-    return px, py
+    lateral = (float(c0), float(c1), float(c2))[LATERAL_ACTION_INDEX]
+    return lateral * lateral_sign * scale, 0.0
 
 CONFIG_OPPOSITE = "opposite"
 CONFIG_SAME_LEFT = "same_side_left"
@@ -2087,7 +2090,8 @@ def agreement_pool(out_dir: str, scenes=None, review_rows=None):
 # --------------------------------------------------------------------------- #
 # Manipulation check
 # --------------------------------------------------------------------------- #
-def manipulation_rate(predictions, scenes, value_col: str = "c0") -> dict:
+def manipulation_rate(predictions, scenes,
+                      value_col: str = f"c{LATERAL_ACTION_INDEX}") -> dict:
     """How often the model acts toward the pasted instance rather than the source.
 
     A composited object is only useful if the model perceives it. Run with the
@@ -2104,7 +2108,8 @@ def manipulation_rate(predictions, scenes, value_col: str = "c0") -> dict:
         predictions: rows carrying `base_scene_id`, `configuration`, and the
             lateral value column, from the neutral condition only.
         scenes: constructed manifest rows, supplying the two positions.
-        value_col: column holding the lateral prediction.
+        value_col: column holding the lateral prediction. The default reads
+            the identified lateral channel (`LATERAL_ACTION_INDEX`).
 
     Returns the rate, the counts, and the per-configuration breakdown.
     """

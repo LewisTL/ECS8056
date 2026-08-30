@@ -18,7 +18,7 @@ Responsibilities:
 
 Two roles, one corpus. The experiments run on constructed scenes (see
 `compose_scenes.py`), which are composited from real Bridge frames. Unaltered
-Bridge frames supply the first-action object-tracking gate in Notebook 04: the
+Bridge frames supply the first-action object-tracking gate in Notebook 03: the
 check that the first predicted action tracks a unique named object, without which
 a miss toward a named referent on constructed scenes is not interpretable as a
 spatial-language failure. A frame that served as a construction base is not that
@@ -116,7 +116,7 @@ CATEGORY_OTHER = "other"                    # no usable spatial term
 # --------------------------------------------------------------------------- #
 # The role a cached frame plays. `construction` frames are the base frames the
 # constructed experiments are composited from; `validation` frames are kept
-# unaltered and supply the first-action object-tracking gate in Notebook 04.
+# unaltered and supply the first-action object-tracking gate in Notebook 03.
 #
 # The two are disjoint by construction rather than by convention. A frame that
 # was edited into an experimental stimulus cannot also be the instrument check
@@ -545,25 +545,33 @@ for _a, _b in ANTONYM_PAIRS:
     SWAP.setdefault(_b, _a)
 
 # Spatial axis each antonym pair contrasts, and the index of the translation
-# component in the action 7-vector [dx, dy, dz, ...] on which a correct response
-# to the swap should appear.
+# component in the action 7-vector on which a correct response to the swap
+# should appear.
 #
-# The probe previously read dx for every pair, which is only right for the
-# lateral terms: a front/back or top/bottom swap has no reason to change the
-# lateral component, so pooling them onto dx adds noise to the measurement. The
-# axis is also what decides which terms admit a mirror control, since a
-# horizontal flip of the image reverses the lateral axis and leaves the other
-# two unchanged.
-AXIS_LATERAL = "lateral"     # dx, reversed by a horizontal image flip
-AXIS_DEPTH = "depth"         # dy, unchanged by a horizontal image flip
-AXIS_VERTICAL = "vertical"   # dz, unchanged by a horizontal image flip
+# The component naming in the OpenVLA layout (dx, dy, dz) cannot be read as
+# geometry. The axis-identification test scored each component and each sign
+# convention against scene geometry, on the demonstration ground truth and on
+# the model, and found the image-lateral signal on component 1 (dy) with the
+# inverted sign (see `compose_scenes.IMAGE_X_TO_LATERAL_SIGN`), not on
+# component 0 as the naming suggests. The axis also decides which terms admit
+# a mirror control, since a horizontal flip of the image reverses the lateral
+# axis and leaves the other two unchanged.
+AXIS_LATERAL = "lateral"     # component 1, reversed by a horizontal image flip
+AXIS_DEPTH = "depth"         # no identified component, see AXIS_INDEX
+AXIS_VERTICAL = "vertical"   # no identified component, see AXIS_INDEX
 # Terms whose contrasted axis depends on the scene rather than on the term.
 # "closer to the plate" points wherever the plate happens to be, so no fixed
 # component can be assigned in advance. These are excluded from axis-specific
 # analysis rather than assigned a plausible-looking default.
 AXIS_SCENE_DEPENDENT = "scene_dependent"
 
-AXIS_INDEX = {AXIS_LATERAL: 0, AXIS_DEPTH: 1, AXIS_VERTICAL: 2}
+# Only the lateral axis carries an identified component. Depth and vertical
+# were previously assigned components 1 and 2 by reading the layout naming as
+# geometry; the lateral finding showed that reading to be unsafe, and no
+# equivalent identification has been run for the other two axes (a horizontal
+# flip only probes the lateral one). Their terms are therefore excluded from
+# axis-specific analysis, like scene-dependent terms, rather than guessed.
+AXIS_INDEX = {AXIS_LATERAL: 1}
 
 TERM_AXIS: dict[str, str] = {
     "left": AXIS_LATERAL,
@@ -605,8 +613,9 @@ def term_axis(term: str) -> str | None:
 def term_axis_index(term: str) -> int | None:
     """Translation component index a term's swap should act on.
 
-    Returns None for unknown terms and for scene-dependent relations, which have
-    no axis that can be fixed ahead of seeing the scene.
+    Returns None for unknown terms, for scene-dependent relations, and for the
+    depth and vertical axes, whose component in the action vector has not been
+    identified. Only lateral terms carry a component the analysis can read.
     """
     axis = term_axis(term)
     return AXIS_INDEX.get(axis) if axis is not None else None

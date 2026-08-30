@@ -21,9 +21,13 @@ pattern across them rather than on any single test:
     That is the instrument check the language tests rest on: a first-step miss
     toward a named referent is evidence of a spatial-language failure only when
     this check has already shown that the first action is an object-directed
-    readout. `object_tracking_by_axis` repeats the scoring on dx, dy, and dz, so
-    a fail on dx can be read as a dead visual channel or as the image-x signal
-    sitting on another translation component.
+    readout. `object_tracking_by_axis` repeats the scoring on dx, dy, and dz,
+    and `object_tracking_by_sign` repeats it under both sign conventions, so a
+    fail on the assumed component can be separated into a dead visual channel,
+    the image-x signal sitting on another translation component, or an
+    inverted sign. Run against the demonstration ground truth and the model,
+    these scans identified component 1 (dy) with the inverted sign as the
+    lateral channel.
 
 Four conventions apply throughout.
 
@@ -36,8 +40,10 @@ that it is unproven.
 The recorded geometry reaches these functions in image coordinates, and the
 convention relating image position to the sign of the lateral action is applied
 here through `lateral_sign`. Holding it outside the prediction log means a
-revision costs a re-read rather than a repeat of every prediction, and it keeps
-the one unresolved link in the chain visible at the point it is used.
+revision costs a re-read rather than a repeat of every prediction. The
+convention was identified empirically by the axis test (component 1, sign -1,
+held as `compose_scenes.IMAGE_X_TO_LATERAL_SIGN`) and is passed in rather than
+assumed, so the identification stays visible at the point it is used.
 
 Any statistic that reads the sign of a prediction accepts `min_magnitude`. Below
 one action bin a sign is not a decision the model could execute, and counting
@@ -75,8 +81,11 @@ LATERAL_TERM_IMAGE_SIGN = {"left": -1, "leftmost": -1, "right": 1, "rightmost": 
 OBJECT_SIDE_LEFT = "left"
 OBJECT_SIDE_RIGHT = "right"
 
-# Translation components, in OpenVLA layout order. Index 0 is treated as lateral
-# until a horizontal image flip shows which component actually reverses.
+# Translation components, in OpenVLA layout order. The names follow the layout,
+# not the geometry: the axis-identification test found the image-lateral signal
+# on component 1 (dy) with the inverted sign, not on dx as the naming suggests.
+# The identified mapping lives in `data.AXIS_INDEX` and
+# `compose_scenes.IMAGE_X_TO_LATERAL_SIGN`.
 TRANSLATION_AXIS_NAMES = {0: "dx", 1: "dy", 2: "dz"}
 TRANSLATION_AXES = tuple(TRANSLATION_AXIS_NAMES)
 
@@ -119,10 +128,11 @@ def has_continuous(df: pd.DataFrame) -> bool:
 def axis_value(df: pd.DataFrame, continuous: bool = True) -> pd.Series:
     """Value on each row's own expected axis, taken from `axis_index`.
 
-    The axis differs per scene, so a single column cannot serve: a left/right
-    pair is read on dx and a front/back pair on dy. Reading the axis from the
-    row is what stops depth and vertical terms being pooled onto the lateral
+    The axis is recorded per row, so a hard-coded column cannot serve: reading
+    it from the row is what stops rows from being pooled onto the wrong
     component, which is how the earlier analysis diluted its own measurement.
+    Only lateral terms carry an identified component (index 1); rows for other
+    axes do not reach axis-specific analysis.
     """
     cols = CONTINUOUS_COLS if continuous else ACTION_COLS
     idx = df["axis_index"].astype(int).to_numpy()
@@ -774,10 +784,12 @@ def toward_object(dx, x_object, x_gripper, *, min_magnitude: float = 0.0,
     column, so no lateral target exists, or when the action is smaller than
     `min_magnitude` and so is not a side the model could execute.
 
-    `lateral_sign` is the convention relating image-x to the sign of `dx`: a
-    positive value means an object further right in the frame should produce a
-    positive action. It is applied here rather than baked into the geometry so a
-    revision is a re-read, matching the constructed-set statistics.
+    `lateral_sign` is the convention relating image-x to the sign of the
+    lateral component: a positive value means an object further right in the
+    frame should produce a positive action. The identified convention is -1
+    (`compose_scenes.IMAGE_X_TO_LATERAL_SIGN`). It is applied here rather than
+    baked into the geometry so a revision is a re-read, matching the
+    constructed-set statistics.
     """
     side = object_side_image(x_object, x_gripper)
     if side == 0:
@@ -824,7 +836,7 @@ def object_tracking_candidates(rows) -> dict:
 
     The wording filter is applied here; instance count is not. A scene labelled
     `duplicate_target='yes'` is excluded because two instances make a term-free
-    instruction ambiguous, and detection in Notebook 04 would only confirm that.
+    instruction ambiguous, and detection in Notebook 03 would only confirm that.
     Every other validation row with a clean term strip and a nameable object is
     returned, so the detector, not the harvest label, decides that the scene
     holds exactly one instance. The prompt stored as `instr_neutral` is
@@ -878,8 +890,34 @@ def _tracking_rate(flags) -> float:
     return float(np.mean(values))
 
 
+def proportion_lower_bound(successes, trials, confidence: float = 0.95) -> float:
+    """One-sided Wilson score lower bound for a binomial proportion.
+
+    The tracking gate reads this rather than the raw rate. A small cell with a
+    perfect rate can still be a handful of lucky draws, and a large cell with a
+    middling rate can still be demonstrably above chance; the bound separates
+    the two where a point threshold cannot. Returns NaN when `trials` is zero.
+    """
+    n = int(trials)
+    if n <= 0:
+        return float("nan")
+    k = int(successes)
+    z = float(stats.norm.ppf(confidence))
+    p = k / n
+    denom = 1.0 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * np.sqrt(p * (1.0 - p) / n + z * z / (4 * n * n)) / denom
+    return float(max(0.0, centre - half))
+
+
 def _side_summary(rows) -> dict:
-    """Toward-object and flip rates for one object-side stratum."""
+    """Toward-object and flip rates for one object-side stratum.
+
+    Alongside each rate the summary carries the counts it was computed from
+    (`n_toward_*`, `n_decided_*`, `n_flip`, `n_flip_decided`), so the gate can
+    place a confidence bound on the rate rather than compare its point value
+    to a threshold.
+    """
     n = len(rows)
     if n == 0:
         return {
@@ -889,6 +927,12 @@ def _side_summary(rows) -> dict:
             "toward_original": float("nan"),
             "toward_mirror": float("nan"),
             "flip_rate": float("nan"),
+            "n_toward_original": 0,
+            "n_decided_original": 0,
+            "n_toward_mirror": 0,
+            "n_decided_mirror": 0,
+            "n_flip": 0,
+            "n_flip_decided": 0,
         }
     orig = [r["toward_original"] for r in rows]
     mir = [r["toward_mirror"] for r in rows]
@@ -902,6 +946,12 @@ def _side_summary(rows) -> dict:
         "toward_original": _tracking_rate(decided_orig),
         "toward_mirror": _tracking_rate(decided_mir),
         "flip_rate": _tracking_rate(flips),
+        "n_toward_original": int(sum(decided_orig)),
+        "n_decided_original": len(decided_orig),
+        "n_toward_mirror": int(sum(decided_mir)),
+        "n_decided_mirror": len(decided_mir),
+        "n_flip": int(sum(flips)),
+        "n_flip_decided": len(flips),
     }
 
 
@@ -987,11 +1037,12 @@ def object_tracking_report(predictions: pd.DataFrame, geometry: pd.DataFrame, *,
                            ) -> dict:
     """Does one translation component track a unique object under a mirror?
 
-    `axis_index` selects `c0`/`a0` (dx), `c1`/`a1` (dy), or `c2`/`a2` (dz). The
-    default is dx, which `TERM_AXIS` treats as lateral. Scoring dy or dz the same
-    way asks whether that component behaves as the image-x channel: a horizontal
-    flip reverses image x, so the true lateral component must reverse and must
-    point at the object on both sides of the gripper.
+    `axis_index` selects `c0`/`a0` (dx), `c1`/`a1` (dy), or `c2`/`a2` (dz).
+    Scoring a component this way asks whether it behaves as the image-x
+    channel: a horizontal flip reverses image x, so the true lateral component
+    must reverse and must point at the object on both sides of the gripper.
+    The identified channel is component 1 with `lateral_sign=-1`; pass those
+    explicitly, since the defaults describe the naive layout reading.
 
     A component that keeps one sign on the original and mirrored frames is not
     that channel. Scoring it as lateral produces a high toward-object rate when
@@ -1149,10 +1200,12 @@ def object_tracking_by_axis(predictions: pd.DataFrame, geometry: pd.DataFrame, *
     A horizontal flip reverses image x. The component that is lateral must
     reverse and must track the object on both sides of the gripper. Components
     that keep one sign are not that channel. `bin_widths`, when given, is a
-    sequence of per-component floors so dy and dz are not judged against the
-    lateral bin width. The gate itself still reads dx; this scan is the check
-    that dx is the right component to have gated on. Pass `require_mirror=False`
-    for demonstration ground truth, which has no mirrored trial.
+    sequence of per-component floors so each component is judged against its
+    own bin width. This scan is the first stage of the axis identification:
+    it locates which component carries the image-x signal, and the sign scan
+    then fixes the convention. It found the signal on component 1, not on dx.
+    Pass `require_mirror=False` for demonstration ground truth, which has no
+    mirrored trial.
     """
     out = {}
     for axis in TRANSLATION_AXES:
@@ -1177,16 +1230,18 @@ def object_tracking_by_sign(
     *,
     axis_index: int,
     signs=(1, -1),
-    min_toward: float = 0.7,
-    min_flip: float = 0.5,
+    floor: float = 0.5,
+    confidence: float = 0.95,
     min_n_per_side: int = 10,
     **report_kwargs,
 ) -> dict:
     """Score one translation component under each image-x sign convention.
 
     A signed cloud that prints as a near-zero toward-object rate under +1 is
-    the complement under -1. The dx gate and `TERM_AXIS` are unchanged until
-    a component and a sign clear the same criteria.
+    the complement under -1, so a component cannot be dismissed until both
+    conventions have been read. This scan, run on the demonstration ground
+    truth and then on the model, is what fixed the lateral channel at
+    component 1 with the inverted sign.
     """
     out = {}
     for raw in signs:
@@ -1198,58 +1253,71 @@ def object_tracking_by_sign(
             lateral_sign=sign, **report_kwargs)
         require_mirror = bool(report_kwargs.get("require_mirror", True))
         gate = object_tracking_gate(
-            report, min_toward=min_toward, min_flip=min_flip,
+            report, floor=floor, confidence=confidence,
             min_n_per_side=min_n_per_side, require_mirror=require_mirror)
         out[sign] = {"report": report, "gate": gate}
     return out
 
 
-def object_tracking_gate(report, *, min_toward: float = 0.7,
-                         min_flip: float = 0.5, min_n_per_side: int = 10,
+def object_tracking_gate(report, *, floor: float = 0.5,
+                         confidence: float = 0.95, min_n_per_side: int = 10,
                          require_mirror: bool = True) -> dict:
     """Pass/fail for the first-action object-tracking instrument check.
 
-    Passes only when toward-object holds on both sides of the gripper, on both
-    the original and the mirrored frame, the action reverses under the mirror,
-    and each side has enough scenes that a rate is not a handful of draws. A
-    pooled rate is not sufficient: that is how an image-left prior masquerades
-    as tracking.
+    Each cell (object side crossed with original and mirrored frame, plus the
+    flip rate per side and overall) must have the one-sided lower confidence
+    bound of its rate above `floor`, and each side must hold enough decided
+    scenes that a rate is not a handful of draws. Chance is one half on every
+    cell, so the default floor requires each cell to be demonstrably better
+    than a coin flip. An earlier form compared point rates to a fixed 70%
+    threshold; that value carried no justification, and a point comparison
+    fails genuinely adequate trackers on sampling noise while a bound degrades
+    gracefully with the cell size. A pooled rate is never sufficient either
+    way: that is how an image-left prior masquerades as tracking.
 
     Demonstration ground truth has no mirrored trial. Pass `require_mirror=False`
-    to require toward-object on both sides of the original frame only.
+    to require the bound on the original frame only.
     """
     reasons = []
     sides = report.get("by_object_side") or {}
+
+    def check(name, label, successes, trials):
+        bound = proportion_lower_bound(successes, trials, confidence)
+        if not (np.isfinite(bound) and bound > floor):
+            rate = successes / trials if trials else float("nan")
+            shown = f"{rate:.1%}" if np.isfinite(rate) else "undefined"
+            lb = f"{bound:.1%}" if np.isfinite(bound) else "undefined"
+            reasons.append(
+                f"{name} {label} {shown} (n={trials}), lower bound {lb} "
+                f"not above {floor:.0%}")
+
+    total_flip, total_flip_decided = 0, 0
     for name in (OBJECT_SIDE_LEFT, OBJECT_SIDE_RIGHT):
         side = sides.get(name) or {}
-        n = int(side.get("n") or 0)
-        n_decided = n - int(side.get("n_undecided_original") or 0)
+        n_decided = int(side.get("n_decided_original") or 0)
         if n_decided < min_n_per_side:
             reasons.append(
                 f"{name}: {n_decided} decided scenes, below the "
                 f"{min_n_per_side} this check requires")
             continue
-        checks = [("toward_original", "original toward-object", min_toward)]
+        check(name, "original toward-object",
+              int(side.get("n_toward_original") or 0), n_decided)
         if require_mirror:
-            checks.extend([
-                ("toward_mirror", "mirrored toward-object", min_toward),
-                ("flip_rate", "flip rate", min_flip),
-            ])
-        for key, label, floor in checks:
-            rate = side.get(key, float("nan"))
-            if not (np.isfinite(rate) and rate >= floor):
-                shown = f"{rate:.1%}" if np.isfinite(rate) else "undefined"
-                reasons.append(f"{name} {label} {shown}, below {floor:.0%}")
+            check(name, "mirrored toward-object",
+                  int(side.get("n_toward_mirror") or 0),
+                  int(side.get("n_decided_mirror") or 0))
+            check(name, "flip rate",
+                  int(side.get("n_flip") or 0),
+                  int(side.get("n_flip_decided") or 0))
+        total_flip += int(side.get("n_flip") or 0)
+        total_flip_decided += int(side.get("n_flip_decided") or 0)
     if require_mirror:
-        overall_flip = report.get("flip_rate", float("nan"))
-        if not (np.isfinite(overall_flip) and overall_flip >= min_flip):
-            shown = f"{overall_flip:.1%}" if np.isfinite(overall_flip) else "undefined"
-            reasons.append(f"overall flip rate {shown}, below {min_flip:.0%}")
+        check("overall", "flip rate", total_flip, total_flip_decided)
     return {
         "pass": not reasons,
         "reasons": reasons,
-        "min_toward": float(min_toward),
-        "min_flip": float(min_flip) if require_mirror else float("nan"),
+        "floor": float(floor),
+        "confidence": float(confidence),
         "min_n_per_side": int(min_n_per_side),
         "require_mirror": bool(require_mirror),
         "n": int(report.get("n") or 0),

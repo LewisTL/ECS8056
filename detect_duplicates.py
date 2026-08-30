@@ -16,7 +16,7 @@ inspection of every scene:
   3. Map the detection scores to a proposal (`yes` / `no` / `unclear`) with a
      transparent decision function. A `yes` proposal excludes the scene from the
      first-action object-tracking gate, because two instances make a term-free
-     instruction ambiguous. Notebook 04 re-detects the remaining validation
+     instruction ambiguous. Notebook 03 re-detects the remaining validation
      frames and keeps those with exactly one instance.
 
 Heavy dependencies (torch, transformers, and optionally spaCy) are imported
@@ -435,9 +435,9 @@ def _load_sam():
 def release_detectors() -> None:
     """Drop cached OWLv2 and SAM weights so a later OpenVLA load can use the GPU.
 
-    Notebook 04 detects geometry first, then loads OpenVLA on the same device.
+    Notebook 03 detects geometry first, then loads OpenVLA on the same device.
     Leaving the detector in memory would contend with the 7B weights on a T4.
-    Construction (Notebook 03) never loads OpenVLA in the same session, so it
+    Construction (Notebook 04) never loads OpenVLA in the same session, so it
     does not need this.
     """
     for key in ("owl", "sam"):
@@ -720,8 +720,8 @@ def run_auto_pass(
     `duplicate_note`, and `duplicate_source='auto'` in a single manifest update.
     Scenes whose target noun cannot be extracted are marked `unclear`. A `yes`
     proposal excludes the scene from the first-action object-tracking gate in
-    Notebook 04, because two instances make a term-free instruction ambiguous.
-    Notebook 04 re-detects every remaining validation frame and keeps those with
+    Notebook 03, because two instances make a term-free instruction ambiguous.
+    Notebook 03 re-detects every remaining validation frame and keeps those with
     exactly one instance. Returns a summary of the proposal counts.
     """
     queue = review_queue(
