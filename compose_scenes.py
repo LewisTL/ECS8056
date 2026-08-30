@@ -197,6 +197,12 @@ CONSTRUCTED_FIELDS = [
     "target_sign_a_image", "target_sign_b_image",
     "source_box", "paste_box", "source_score",
     "cutout_mode", "padding", "feather", "seed",
+    # Hand labels copied back from the blind geometry-agreement sample by
+    # `apply_validation_labels`. Empty for scenes outside the sample, so an
+    # empty value means unlabelled rather than agreeing. The recorded geometry
+    # columns above are never rewritten from these.
+    "human_configuration", "human_two_instances",
+    "human_gripper_ok", "human_paste_plausible",
 ]
 
 
@@ -1561,6 +1567,64 @@ def validation_agreement(rows) -> dict:
                 / len(answered) if answered else float("nan")),
         }
     return out
+
+
+# The label columns carried from the validation sample onto the constructed
+# manifest. `notes` stays in the sample file, which remains the record of the
+# labelling session.
+MANIFEST_LABEL_FIELDS = ("human_configuration", "human_two_instances",
+                         "human_gripper_ok", "human_paste_plausible")
+
+
+def apply_validation_labels(out_dir: str) -> dict:
+    """Copy the hand labels from the validation sample onto the manifest rows.
+
+    Each labelled scene's manifest row gains the annotator's reading in the
+    `human_*` columns, so a frame carries both what the pipeline recorded and
+    what the image was judged to show, and a disagreement is visible on the
+    row itself rather than only in the sample file. The recorded geometry is
+    never rewritten from the labels: `configuration` and the coordinate
+    columns are derived from the placement, and overwriting them would erase
+    the disagreement the blind sample exists to expose while leaving the
+    coordinates asserting the original arrangement. Scenes outside the sample
+    keep empty labels, so an empty value means unlabelled rather than
+    agreeing.
+
+    The manifest is rewritten atomically under the union of its existing
+    header and the label columns, preserving any columns beyond the current
+    schema. Returns the row count, how many rows carry a label, and how many
+    of those disagree with the recorded arrangement.
+    """
+    path = os.path.join(out_dir, MANIFEST_NAME)
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        header = list(reader.fieldnames or [])
+        rows = [dict(r) for r in reader]
+    labels = {r["construct_id"]: r for r in load_validation_sample(out_dir)
+              if r.get("human_configuration")}
+
+    fields = header + [c for c in MANIFEST_LABEL_FIELDS if c not in header]
+    labelled = 0
+    disagreements = 0
+    for row in rows:
+        label = labels.get(row.get("construct_id", ""))
+        if label is None:
+            continue
+        for col in MANIFEST_LABEL_FIELDS:
+            row[col] = label.get(col, "")
+        labelled += 1
+        if label["human_configuration"] != row.get("configuration", ""):
+            disagreements += 1
+
+    tmp = path + ".tmp"
+    with open(tmp, "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({k: row.get(k, "") for k in fields})
+    os.replace(tmp, path)
+    return {"rows": len(rows), "labelled": labelled,
+            "configuration_disagreements": disagreements}
 
 
 # --------------------------------------------------------------------------- #
