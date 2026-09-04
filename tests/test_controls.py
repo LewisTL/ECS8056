@@ -61,15 +61,27 @@ def test_antonyms_share_an_axis():
         assert term_axis(term) == term_axis(opposite), (term, opposite)
 
 
-def test_lateral_terms_map_to_dx():
+def test_lateral_terms_map_to_the_identified_component():
+    # The axis-identification test found the image-lateral signal on
+    # component 1 of the action vector, not on component 0 as the OpenVLA
+    # layout naming (dx) suggests.
     for term in ("left", "right", "leftmost", "rightmost"):
         assert is_lateral_term(term)
-        assert term_axis_index(term) == AXIS_INDEX[AXIS_LATERAL] == 0
+        assert term_axis_index(term) == AXIS_INDEX[AXIS_LATERAL] == 1
 
 
 def test_scene_dependent_terms_have_no_fixed_component():
     for term in ("closer to", "farther from"):
         assert term_axis(term) == AXIS_SCENE_DEPENDENT
+        assert term_axis_index(term) is None
+
+
+def test_unidentified_axes_have_no_component():
+    # Depth and vertical terms keep their axis label but carry no component
+    # index: no identification equivalent to the lateral one has been run.
+    for term in ("in front of", "behind", "nearest", "top", "bottom"):
+        assert not is_lateral_term(term)
+        assert term_axis(term) is not None
         assert term_axis_index(term) is None
 
 

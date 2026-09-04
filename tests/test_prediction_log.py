@@ -17,6 +17,7 @@ from prediction_log import (
     LEADING_LOG_FIELDS,
     PROBE_EXTRA_FIELDS,
     RUN_METADATA_FIELDS,
+    TRACKING_EXTRA_FIELDS,
     append_row,
     canonical_log_fields,
     ensure_readable,
@@ -24,6 +25,7 @@ from prediction_log import (
     probe_log_fields,
     repair_log,
     resolve_schema,
+    tracking_log_fields,
     widen_log,
 )
 
@@ -73,6 +75,14 @@ def test_the_probe_row_width_is_declared_rather_than_discovered():
     """
     assert len(probe_log_fields()) == 67
     assert len(canonical_log_fields(PROBE_EXTRA, with_readout=False)) == 38
+
+
+def test_tracking_log_fields_are_the_instrument_check_schema():
+    fields = tracking_log_fields()
+    extra = list(TRACKING_EXTRA_FIELDS)
+    assert fields[-len(extra):] == extra
+    assert "c0" in fields
+    assert "scene_id" in fields
 
 
 def test_canonical_fields_without_a_readout_omit_only_the_readout():

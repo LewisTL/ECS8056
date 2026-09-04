@@ -30,7 +30,6 @@ from compose_scenes import (
     DEFAULT_FEATHER,
     DEFAULT_MIN_GAP,
     DEFAULT_PADDING,
-    DEPTH_TO_IMAGE_X,
     GATE_BAD_NOUN,
     GATE_MULTI,
     GATE_NO_INSTANCE,
@@ -51,7 +50,10 @@ from compose_scenes import (
     SYNTHESISED_TEMPLATE,
     agreement_pool,
     append_constructed_manifest,
+    apply_validation_labels,
     approval_summary,
+    arrangement_target_signs,
+    resolve_scene_arrangement,
     approve,
     approved_ids,
     DEFAULT_TARGETS,
@@ -622,18 +624,18 @@ def test_build_scene_records_the_supplied_gripper_centre():
     assert "y_gripper" in CONSTRUCTED_FIELDS
 
 
-def test_action_image_delta_maps_each_component_onto_the_frame():
-    px, py = action_image_delta(0.01, 0.0, 0.0)
+def test_action_image_delta_projects_only_the_identified_lateral_channel():
+    # Component 1 is the identified lateral channel and maps to image x
+    # through the inverted sign convention.
+    px, py = action_image_delta(0.0, 0.01, 0.0)
     assert px == pytest.approx(0.01 * IMAGE_X_TO_LATERAL_SIGN)
     assert py == pytest.approx(0.0)
 
-    px, py = action_image_delta(0.0, 0.01, 0.0)
-    assert px == pytest.approx(0.01 * DEPTH_TO_IMAGE_X)
-    assert py > 0
-
-    px, py = action_image_delta(0.0, 0.0, 0.01)
+    # The other components have no identified image direction and contribute
+    # nothing to the overlay.
+    px, py = action_image_delta(0.01, 0.0, 0.03)
     assert px == pytest.approx(0.0)
-    assert py < 0
+    assert py == pytest.approx(0.0)
 
     scaled = action_image_delta(0.01, 0.02, 0.03, scale=10.0)
     unit = action_image_delta(0.01, 0.02, 0.03, scale=1.0)
@@ -780,6 +782,121 @@ def test_a_redraw_updates_the_pool_but_keeps_the_labels(tmp_path):
     after = load_validation_sample(out_dir)
     assert all(r["pool"] == POOL_FROZEN for r in after)
     assert sum(1 for r in after if r["human_configuration"]) == 1
+
+
+def test_apply_validation_labels_annotates_the_manifest_without_touching_geometry(tmp_path):
+    """Hand labels land on the frame's own row; the recorded geometry does not move.
+
+    A disagreement must stay visible on the manifest rather than replacing the
+    recorded arrangement, and a scene without a label must stay empty so an
+    unlabelled scene cannot read as an agreeing one.
+    """
+    out_dir = str(tmp_path)
+    scenes = _pool(n_left=1, n_right=1)
+    write_constructed_manifest(scenes, out_dir)
+    write_validation_sample(draw_validation_sample(scenes, n=2, seed=0), out_dir)
+
+    sample = load_validation_sample(out_dir)
+    sample[0]["human_configuration"] = "unclear"
+    sample[0]["human_two_instances"] = "yes"
+    sample[0]["human_gripper_ok"] = "yes"
+    sample[0]["human_paste_plausible"] = "no"
+    write_validation_sample(sample, out_dir)
+
+    result = apply_validation_labels(out_dir)
+    assert result["labelled"] == 1
+    assert result["configuration_disagreements"] == 1
+
+    rows = {r["construct_id"]: r for r in load_constructed_manifest(out_dir)}
+    annotated = rows[sample[0]["construct_id"]]
+    assert annotated["human_configuration"] == "unclear"
+    assert annotated["human_paste_plausible"] == "no"
+    assert annotated["configuration"] == sample[0]["auto_configuration"]
+    untouched = [r for cid, r in rows.items()
+                 if cid != sample[0]["construct_id"]]
+    assert all(r["human_configuration"] == "" for r in untouched)
+
+
+def test_apply_validation_labels_counts_agreement_as_no_disagreement(tmp_path):
+    out_dir = str(tmp_path)
+    scenes = _pool(n_left=1, n_right=1)
+    write_constructed_manifest(scenes, out_dir)
+    write_validation_sample(draw_validation_sample(scenes, n=1, seed=0), out_dir)
+
+    sample = load_validation_sample(out_dir)
+    sample[0]["human_configuration"] = sample[0]["auto_configuration"]
+    write_validation_sample(sample, out_dir)
+
+    result = apply_validation_labels(out_dir)
+    assert result["labelled"] == 1
+    assert result["configuration_disagreements"] == 0
+
+
+def _arrangement_scene(**overrides):
+    scene = {
+        "construct_id": "c000001_opposite_left",
+        "configuration": CONFIG_OPPOSITE,
+        "expected_sign_image": 1,
+        "target_sign_a_image": 1,
+        "target_sign_b_image": -1,
+        "human_configuration": "",
+    }
+    scene.update(overrides)
+    return scene
+
+
+def test_arrangement_target_signs_follow_the_arrangement():
+    assert arrangement_target_signs(CONFIG_SAME_LEFT, 1) == (-1, -1)
+    assert arrangement_target_signs(CONFIG_SAME_RIGHT, 1) == (1, 1)
+    assert arrangement_target_signs(CONFIG_OPPOSITE, 1) == (1, -1)
+    assert arrangement_target_signs(CONFIG_OPPOSITE, -1) == (-1, 1)
+
+
+def test_unlabelled_and_agreeing_scenes_keep_the_recorded_arrangement():
+    for label in ("", CONFIG_OPPOSITE):
+        resolved = resolve_scene_arrangement(
+            _arrangement_scene(human_configuration=label))
+        assert resolved == {
+            "configuration": CONFIG_OPPOSITE,
+            "target_sign_a_image": 1,
+            "target_sign_b_image": -1,
+            "relabelled": False,
+        }
+
+
+def test_an_unclear_label_drops_the_scene():
+    assert resolve_scene_arrangement(
+        _arrangement_scene(human_configuration="unclear")) is None
+
+
+def test_a_disagreeing_label_wins_and_rederives_the_target_signs():
+    """The human arrangement decides how the scene is probed.
+
+    An opposite scene relabelled same-side means the gripper was mislocalised,
+    so the gripper-relative signs are re-derived from the label rather than
+    kept from the discredited coordinates. The instances' relative order is
+    exact by construction, so a scene relabelled opposite splits its signs by
+    `expected_sign_image`.
+    """
+    to_same_side = resolve_scene_arrangement(
+        _arrangement_scene(human_configuration=CONFIG_SAME_RIGHT))
+    assert to_same_side == {
+        "configuration": CONFIG_SAME_RIGHT,
+        "target_sign_a_image": 1,
+        "target_sign_b_image": 1,
+        "relabelled": True,
+    }
+
+    to_opposite = resolve_scene_arrangement(_arrangement_scene(
+        configuration=CONFIG_SAME_LEFT, expected_sign_image=-1,
+        target_sign_a_image=-1, target_sign_b_image=-1,
+        human_configuration=CONFIG_OPPOSITE))
+    assert to_opposite == {
+        "configuration": CONFIG_OPPOSITE,
+        "target_sign_a_image": -1,
+        "target_sign_b_image": 1,
+        "relabelled": True,
+    }
 
 
 def test_validation_agreement_counts_only_labelled_rows():
@@ -1287,7 +1404,7 @@ def _approve_all(rows):
 def test_review_rows_cover_every_scene_not_a_sample():
     """The screen decides inclusion per scene, so it is a census.
 
-    The random sample keeps its separate job of measuring geometry agreement.
+    Geometry agreement is a separate measurement on the eligible pool.
     """
     scenes = _pool()
     rows = build_review_rows(scenes)
@@ -1639,9 +1756,11 @@ def _manipulation_inputs(toward_pasted: bool):
                        "x_pasted": 220.0, "x_gripper": 160.0,
                        "configuration": CONFIG_OPPOSITE})
         # The source sits left of the start position and the duplicate right,
-        # so the sign of the action says which one was reached for.
-        value = 0.01 if toward_pasted else -0.01
-        predictions.append({"construct_id": construct_id, "c0": value,
+        # so the sign of the lateral action says which one was reached for.
+        # Under the identified convention a rightward target reads negative.
+        value = 0.01 * IMAGE_X_TO_LATERAL_SIGN if toward_pasted \
+            else -0.01 * IMAGE_X_TO_LATERAL_SIGN
+        predictions.append({"construct_id": construct_id, "c1": value,
                             "configuration": CONFIG_OPPOSITE})
     return predictions, scenes
 
@@ -1663,7 +1782,7 @@ def test_manipulation_rate_skips_scenes_that_cannot_distinguish():
     # for either, so the scene carries no information here.
     scenes = [{"construct_id": "c1", "x_source": 100.0, "x_pasted": 60.0,
                "x_gripper": 160.0, "configuration": CONFIG_SAME_LEFT}]
-    predictions = [{"construct_id": "c1", "c0": -0.01,
+    predictions = [{"construct_id": "c1", "c1": -0.01,
                     "configuration": CONFIG_SAME_LEFT}]
     assert manipulation_rate(predictions, scenes)["n"] == 0
 

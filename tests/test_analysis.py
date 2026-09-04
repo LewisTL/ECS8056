@@ -21,6 +21,10 @@ import pandas as pd
 import pytest
 
 from analysis import (
+    OBJECT_SIDE_LEFT,
+    OBJECT_SIDE_RIGHT,
+    TRACKING_CONDITION_MIRROR,
+    TRACKING_CONDITION_ORIGINAL,
     absolute_congruence,
     axis_value,
     congruence_test,
@@ -28,10 +32,24 @@ from analysis import (
     lexical_check,
     mirror_check,
     mirror_check_by_configuration,
+    mirrored_x,
+    object_side_image,
+    object_tracking_by_axis,
+    object_tracking_by_sign,
+    apply_tracking_instruction,
+    attach_tracking_ground_truth,
+    object_tracking_candidates,
+    object_tracking_gate,
+    object_tracking_report,
+    proportion_lower_bound,
+    stale_tracking_prompt_count,
+    tracking_gt_predictions,
+    tracking_instruction,
     resolution_report,
     same_side_test,
     term_effect,
     tost_equivalence,
+    toward_object,
     value_column,
     wilcoxon_paired,
 )
@@ -396,6 +414,7 @@ def test_statistics_are_empty_safe():
     assert same_side_test(empty)["n"] == 0
     assert absolute_congruence(empty)["n"] == 0
     assert determinism_check(empty)["deterministic"]
+    assert object_tracking_report(empty, empty)["n"] == 0
 
 
 # --------------------------------------------------------------------------- #
@@ -415,3 +434,345 @@ def test_determinism_check_catches_a_disagreeing_repeat():
     result = determinism_check(doubled)
     assert not result["deterministic"]
     assert result["max_spread"] > 0
+
+
+# --------------------------------------------------------------------------- #
+# First-action object tracking
+# --------------------------------------------------------------------------- #
+GRIPPER_X = 320.0
+FRAME_WIDTH = 640.0
+OBJECT_LEFT_X = 200.0
+OBJECT_RIGHT_X = 440.0
+
+
+def _track_pred(scene_id, condition, values):
+    """One tracking-log row. `values` is a 3-tuple (dx, dy, dz)."""
+    row = {
+        "scene_id": scene_id, "condition": condition, "role": "n",
+        "axis_index": 0,
+    }
+    padded = list(values) + [0.0] * (7 - len(values))
+    for i in range(7):
+        row[f"c{i}"] = padded[i]
+        row[f"a{i}"] = padded[i]
+    return row
+
+
+def _track_geom(scene_id, x_object):
+    return {
+        "scene_id": scene_id,
+        "x_object": x_object,
+        "x_gripper": GRIPPER_X,
+        "image_width": FRAME_WIDTH,
+    }
+
+
+def tracking_synthetic(model, n=40, scale=0.01):
+    """Predictions and geometry for a unique-object tracking check.
+
+    Half the objects sit left of the gripper, half right. `grounded` reaches
+    for the object and reverses under a mirror. `image_left` always emits a
+    negative lateral action, which agrees with the object only when the object
+    is on the left and does not reverse. `blind` emits zero.
+    """
+    preds, geom = [], []
+    for i in range(n):
+        scene = f"t{i}"
+        x_object = OBJECT_LEFT_X if i % 2 == 0 else OBJECT_RIGHT_X
+        side = np.sign(x_object - GRIPPER_X)
+        if model == "grounded":
+            orig = side * scale
+            mirrored_side = np.sign(
+                mirrored_x(x_object, FRAME_WIDTH) - mirrored_x(GRIPPER_X, FRAME_WIDTH))
+            mir = mirrored_side * scale
+        elif model == "image_left":
+            orig = mir = -scale
+        else:
+            orig = mir = 0.0
+        preds.append(_track_pred(scene, TRACKING_CONDITION_ORIGINAL, (orig, 0.0, 0.0)))
+        preds.append(_track_pred(scene, TRACKING_CONDITION_MIRROR, (mir, 0.0, 0.0)))
+        geom.append(_track_geom(scene, x_object))
+    return pd.DataFrame(preds), pd.DataFrame(geom)
+
+
+def test_object_side_image_and_mirror_are_opposites():
+    assert object_side_image(OBJECT_LEFT_X, GRIPPER_X) == -1
+    assert object_side_image(OBJECT_RIGHT_X, GRIPPER_X) == 1
+    assert object_side_image(GRIPPER_X, GRIPPER_X) == 0
+    # A horizontal flip swaps the object's side of the gripper.
+    assert object_side_image(
+        mirrored_x(OBJECT_LEFT_X, FRAME_WIDTH),
+        mirrored_x(GRIPPER_X, FRAME_WIDTH),
+    ) == 1
+
+
+def test_toward_object_follows_the_recorded_side():
+    assert toward_object(-0.01, OBJECT_LEFT_X, GRIPPER_X) is True
+    assert toward_object(0.01, OBJECT_LEFT_X, GRIPPER_X) is False
+    assert toward_object(0.01, OBJECT_RIGHT_X, GRIPPER_X) is True
+    assert toward_object(0.0, OBJECT_RIGHT_X, GRIPPER_X) is None
+    assert toward_object(0.01, GRIPPER_X, GRIPPER_X) is None
+    # Below one bin the sign is not a decision the model could execute.
+    assert toward_object(0.0001, OBJECT_RIGHT_X, GRIPPER_X,
+                         min_magnitude=0.001) is None
+
+
+def test_toward_object_applies_the_sign_convention_at_read_time():
+    assert toward_object(-0.01, OBJECT_LEFT_X, GRIPPER_X, lateral_sign=1) is True
+    assert toward_object(-0.01, OBJECT_LEFT_X, GRIPPER_X, lateral_sign=-1) is False
+
+
+def test_object_tracking_report_passes_only_for_a_tracker():
+    grounded = object_tracking_report(*tracking_synthetic("grounded"))
+    prior = object_tracking_report(*tracking_synthetic("image_left"))
+    blind = object_tracking_report(*tracking_synthetic("blind"))
+
+    assert grounded["n"] == 40
+    assert grounded["toward_original"] == pytest.approx(1.0)
+    assert grounded["toward_mirror"] == pytest.approx(1.0)
+    assert grounded["flip_rate"] == pytest.approx(1.0)
+    assert grounded["by_object_side"][OBJECT_SIDE_LEFT]["toward_original"] == pytest.approx(1.0)
+    assert grounded["by_object_side"][OBJECT_SIDE_RIGHT]["toward_original"] == pytest.approx(1.0)
+
+    # An image-left prior agrees only when the object happens to sit on the left
+    # and does not reverse when the frame is mirrored.
+    assert prior["by_object_side"][OBJECT_SIDE_LEFT]["toward_original"] == pytest.approx(1.0)
+    assert prior["by_object_side"][OBJECT_SIDE_RIGHT]["toward_original"] == pytest.approx(0.0)
+    assert prior["flip_rate"] == pytest.approx(0.0)
+    assert prior["negative_rate_original"] == pytest.approx(1.0)
+    assert prior["negative_rate_mirror"] == pytest.approx(1.0)
+
+    assert blind["n"] == 40
+    assert blind["n_undecided_original"] == 40
+    assert np.isnan(blind["toward_original"])
+
+
+def test_object_tracking_gate_rejects_an_image_left_prior():
+    grounded = object_tracking_gate(object_tracking_report(*tracking_synthetic("grounded")))
+    prior = object_tracking_gate(object_tracking_report(*tracking_synthetic("image_left")))
+    assert grounded["pass"]
+    assert not prior["pass"]
+    assert any("right" in reason for reason in prior["reasons"])
+
+
+def test_object_tracking_gate_rejects_a_side_with_too_few_scenes():
+    preds, geom = tracking_synthetic("grounded", n=4)
+    report = object_tracking_report(preds, geom)
+    gate = object_tracking_gate(report, min_n_per_side=10)
+    assert not gate["pass"]
+    assert any("below the 10" in reason for reason in gate["reasons"])
+
+
+def test_proportion_lower_bound_tracks_both_rate_and_cell_size():
+    assert np.isnan(proportion_lower_bound(0, 0))
+    # A perfect rate on two scenes is not demonstrably above chance.
+    assert proportion_lower_bound(2, 2) < 0.5
+    # The same rate on twenty scenes is.
+    assert proportion_lower_bound(20, 20) > 0.5
+    # The bound never exceeds the rate itself.
+    assert proportion_lower_bound(120, 200) < 0.6
+
+
+def test_object_tracking_gate_reads_bounds_not_point_rates():
+    def report_with(n_toward, n_decided):
+        side = {
+            "n": n_decided,
+            "n_decided_original": n_decided,
+            "n_toward_original": n_toward,
+        }
+        return {
+            "n": 2 * n_decided,
+            "by_object_side": {OBJECT_SIDE_LEFT: dict(side),
+                               OBJECT_SIDE_RIGHT: dict(side)},
+        }
+
+    # The same 60% rate fails on 20 decided scenes and passes on 200: the
+    # criterion is the lower confidence bound, not the point rate.
+    small = object_tracking_gate(report_with(12, 20), require_mirror=False)
+    large = object_tracking_gate(report_with(120, 200), require_mirror=False)
+    assert not small["pass"]
+    assert large["pass"]
+
+
+def test_object_tracking_report_is_empty_safe():
+    empty = pd.DataFrame(columns=["scene_id", "condition", "c0", "a0"])
+    assert object_tracking_report(empty, empty)["n"] == 0
+
+
+def test_object_tracking_candidates_keep_single_object_validation_rows():
+    from data import SPLIT_CONSTRUCTION, SPLIT_VALIDATION
+
+    rows = [
+        {"split": SPLIT_VALIDATION, "duplicate_target": "no",
+         "instruction": "pick up the cup on the left"},
+        {"split": SPLIT_VALIDATION, "duplicate_target": "yes",
+         "instruction": "pick up the cup on the left"},
+        {"split": SPLIT_CONSTRUCTION, "duplicate_target": "no",
+         "instruction": "pick up the cup on the left"},
+        {"split": SPLIT_VALIDATION, "duplicate_target": "no",
+         "instruction": "put the cup on the shelf"},
+    ]
+    result = object_tracking_candidates(rows)
+    assert result["n"] == 1
+    kept = result["rows"][0]
+    assert kept["noun"] == "cup"
+    assert kept["instr_neutral"] == "pick up the cup"
+    assert kept["spatial_term"] == "left"
+    assert result["skipped"]["duplicate"] == 1
+    assert result["skipped"]["split"] == 1
+    assert result["skipped"]["pair"] == 1
+
+
+def test_tracking_instruction_fixes_the_verb():
+    from data import SPLIT_VALIDATION
+
+    assert tracking_instruction("cup") == "pick up the cup"
+    rows = [
+        {"split": SPLIT_VALIDATION, "duplicate_target": "no",
+         "instruction": "grab the mug on the right"},
+    ]
+    result = object_tracking_candidates(rows)
+    assert result["n"] == 1
+    assert result["rows"][0]["noun"] == "mug"
+    assert result["rows"][0]["instr_neutral"] == "pick up the mug"
+
+
+def test_apply_tracking_instruction_rewrites_stored_prompts():
+    rows = [{"noun": "spoon", "instr_neutral": "grab the spoon"}]
+    apply_tracking_instruction(rows)
+    assert rows[0]["instr_neutral"] == "pick up the spoon"
+
+
+def test_stale_tracking_prompt_count():
+    rows = [
+        {"noun": "cup", "instruction": "pick up the cup"},
+        {"noun": "cup", "instruction": "grab the cup"},
+        {"noun": "", "instruction": "pick up the cup"},
+    ]
+    assert stale_tracking_prompt_count(rows) == 1
+
+
+def test_object_tracking_candidates_admit_unreviewed_and_unclear():
+    """Detection, not the harvest label, decides that a scene holds one instance.
+
+    `yes` is excluded because two instances make the term-free instruction
+    ambiguous. Unreviewed and unclear rows still go to the detector.
+    """
+    from data import SPLIT_VALIDATION
+
+    rows = [
+        {"split": SPLIT_VALIDATION, "duplicate_target": "unreviewed",
+         "instruction": "pick up the spoon on the right"},
+        {"split": SPLIT_VALIDATION, "duplicate_target": "unclear",
+         "instruction": "pick up the spoon on the right"},
+    ]
+    result = object_tracking_candidates(rows)
+    assert result["n"] == 2
+    assert result["skipped"]["duplicate"] == 0
+
+
+def _grounded_pair(x_object, scale=0.01):
+    side = np.sign(x_object - GRIPPER_X)
+    orig = side * scale
+    mirrored_side = np.sign(
+        mirrored_x(x_object, FRAME_WIDTH) - mirrored_x(GRIPPER_X, FRAME_WIDTH))
+    return orig, mirrored_side * scale
+
+
+def test_object_tracking_report_reads_the_requested_axis():
+    preds, geom = [], []
+    for i in range(20):
+        scene = f"t{i}"
+        x_object = OBJECT_LEFT_X if i % 2 == 0 else OBJECT_RIGHT_X
+        orig, mir = _grounded_pair(x_object)
+        preds.append(_track_pred(scene, TRACKING_CONDITION_ORIGINAL, (0.0, orig, 0.0)))
+        preds.append(_track_pred(scene, TRACKING_CONDITION_MIRROR, (0.0, mir, 0.0)))
+        geom.append(_track_geom(scene, x_object))
+    preds, geom = pd.DataFrame(preds), pd.DataFrame(geom)
+    on_dx = object_tracking_report(preds, geom)
+    on_dy = object_tracking_report(preds, geom, axis_index=1)
+    assert on_dx["n_undecided_original"] == 20
+    assert on_dy["flip_rate"] == pytest.approx(1.0)
+    assert on_dy["toward_original"] == pytest.approx(1.0)
+    assert on_dy["toward_mirror"] == pytest.approx(1.0)
+
+
+def test_object_tracking_by_axis_separates_constant_dx_from_flipping_dy():
+    preds, geom = [], []
+    scale = 0.01
+    for i in range(40):
+        scene = f"t{i}"
+        x_object = OBJECT_LEFT_X if i % 2 == 0 else OBJECT_RIGHT_X
+        orig, mir = _grounded_pair(x_object, scale)
+        preds.append(_track_pred(
+            scene, TRACKING_CONDITION_ORIGINAL, (-scale, orig, 0.0)))
+        preds.append(_track_pred(
+            scene, TRACKING_CONDITION_MIRROR, (-scale, mir, 0.0)))
+        geom.append(_track_geom(scene, x_object))
+    preds, geom = pd.DataFrame(preds), pd.DataFrame(geom)
+    scan = object_tracking_by_axis(preds, geom)
+    dx, dy, dz = scan[0], scan[1], scan[2]
+    assert dx["name"] == "dx"
+    assert dx["flip_rate"] == pytest.approx(0.0)
+    assert dx["negative_rate_original"] == pytest.approx(1.0)
+    assert dx["by_object_side"][OBJECT_SIDE_LEFT]["toward_original"] == pytest.approx(1.0)
+    assert dx["by_object_side"][OBJECT_SIDE_RIGHT]["toward_original"] == pytest.approx(0.0)
+    assert not object_tracking_gate(dx)["pass"]
+    assert dy["flip_rate"] == pytest.approx(1.0)
+    assert dy["toward_original"] == pytest.approx(1.0)
+    assert object_tracking_gate(dy)["pass"]
+    assert dz["n_undecided_original"] == 40
+
+
+def test_attach_tracking_ground_truth_joins_on_episode_index():
+    geom = [{"scene_id": "b1", "episode_index": 7, "x_object": 1}]
+    man = [{"episode_index": "7", "gt_dx": 0.1, "gt_dy": 0.2, "gt_dz": -0.3}]
+    out = attach_tracking_ground_truth(geom, man)
+    assert out.loc[0, "gt_dx"] == pytest.approx(0.1)
+    assert out.loc[0, "gt_dz"] == pytest.approx(-0.3)
+
+
+def test_tracking_gt_predictions_copies_gt_columns():
+    geom = pd.DataFrame([{
+        "scene_id": "b1", "gt_dx": 0.01, "gt_dy": 0.0, "gt_dz": -0.02,
+    }, {
+        "scene_id": "b2", "gt_dx": "", "gt_dy": "", "gt_dz": "",
+    }])
+    preds = tracking_gt_predictions(geom)
+    assert len(preds) == 1
+    assert preds.loc[0, "scene_id"] == "b1"
+    assert list(preds["condition"]) == [TRACKING_CONDITION_ORIGINAL]
+    assert preds.loc[0, "c0"] == pytest.approx(0.01)
+    assert preds.loc[0, "c2"] == pytest.approx(-0.02)
+
+
+def test_ground_truth_gate_scores_the_original_frame_only():
+    preds, geom = tracking_synthetic("grounded")
+    orig = preds[preds["condition"] == TRACKING_CONDITION_ORIGINAL]
+    report = object_tracking_report(orig, geom, require_mirror=False)
+    assert report["n"] == 40
+    assert np.isnan(report["flip_rate"])
+    gate = object_tracking_gate(report, require_mirror=False)
+    assert gate["pass"]
+    assert gate["require_mirror"] is False
+
+
+def test_ground_truth_gate_rejects_a_constant_sign():
+    preds, geom = tracking_synthetic("image_left")
+    orig = preds[preds["condition"] == TRACKING_CONDITION_ORIGINAL]
+    report = object_tracking_report(orig, geom, require_mirror=False)
+    gate = object_tracking_gate(report, require_mirror=False, min_n_per_side=10)
+    assert not gate["pass"]
+    assert any("right" in reason and "toward" in reason for reason in gate["reasons"])
+    assert not any("flip" in reason for reason in gate["reasons"])
+
+
+def test_sign_scan_inverts_toward_object_on_the_original_frame():
+    preds, geom = tracking_synthetic("grounded")
+    orig = preds[preds["condition"] == TRACKING_CONDITION_ORIGINAL]
+    scan = object_tracking_by_sign(
+        orig, geom, axis_index=0, require_mirror=False, min_n_per_side=10)
+    assert scan[1]["gate"]["pass"]
+    assert not scan[-1]["gate"]["pass"]
+    assert scan[-1]["report"]["toward_original"] == pytest.approx(
+        1.0 - scan[1]["report"]["toward_original"])

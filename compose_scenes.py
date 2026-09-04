@@ -197,9 +197,9 @@ CONSTRUCTED_FIELDS = [
     "target_sign_a_image", "target_sign_b_image",
     "source_box", "paste_box", "source_score",
     "cutout_mode", "padding", "feather", "seed",
-    # Hand labels copied back from the blind geometry-agreement sample by
-    # `apply_validation_labels`. Empty for scenes outside the sample, so an
-    # empty value means unlabelled rather than agreeing. The recorded geometry
+    # Hand labels copied back from the blind geometry-agreement file by
+    # `apply_validation_labels`. Empty when the scene has not yet been labelled,
+    # so an empty value means unlabelled rather than agreeing. The recorded geometry
     # columns above are never rewritten from these.
     "human_configuration", "human_two_instances",
     "human_gripper_ok", "human_paste_plausible",
@@ -1359,21 +1359,18 @@ def summarise_diagnosis(records, *, single_high: float = SINGLE_HIGH) -> dict:
 # Validation sample
 # --------------------------------------------------------------------------- #
 # The measurement reads direction from the recorded geometry, so that geometry
-# is the study's central assumption and it rests on an open-vocabulary detector
-# that was never evaluated on this data. A hand-labelled sample gives it a
-# reportable agreement number.
+# is the central assumption of the constructed set and it rests on an
+# open-vocabulary detector never evaluated on this data. Every scene in the
+# eligible pool is labelled by hand, which gives the recorded geometry a
+# reportable agreement number on the set the probe runs on.
 #
-# The sample is drawn at random and never chosen, so the inclusion rule stays
-# mechanical: a sample picked by eye would be selected on the same appearance
-# that the labelling then judges, and the agreement would measure nothing.
-#
-# Which scenes it is drawn from is resolved by `agreement_pool` rather than by the
+# Which scenes are eligible is resolved by `agreement_pool` rather than by the
 # caller, so no stage can decide for itself what the pool is.
 
 VALIDATION_NAME = "validation_sample.csv"
 
-# Where an agreement sample was drawn from, recorded with the sample so its
-# provenance is stated rather than inferred from when it happened to be drawn.
+# Where an agreement row was taken from, recorded with the file so its
+# provenance is stated rather than inferred from when it was queued.
 POOL_FROZEN = "frozen"
 POOL_APPROVED = "approved"
 
@@ -1577,17 +1574,17 @@ MANIFEST_LABEL_FIELDS = ("human_configuration", "human_two_instances",
 
 
 def apply_validation_labels(out_dir: str) -> dict:
-    """Copy the hand labels from the validation sample onto the manifest rows.
+    """Copy the hand labels from the validation file onto the manifest rows.
 
     Each labelled scene's manifest row gains the annotator's reading in the
     `human_*` columns, so a frame carries both what the pipeline recorded and
     what the image was judged to show, and a disagreement is visible on the
-    row itself rather than only in the sample file. The recorded geometry is
+    row itself rather than only in the label file. The recorded geometry is
     never rewritten from the labels: `configuration` and the coordinate
     columns are derived from the placement, and overwriting them would erase
-    the disagreement the blind sample exists to expose while leaving the
-    coordinates asserting the original arrangement. Scenes outside the sample
-    keep empty labels, so an empty value means unlabelled rather than
+    the disagreement the labels exist to expose while leaving the
+    coordinates asserting the original arrangement. Scenes without a label
+    keep empty values, so an empty value means unlabelled rather than
     agreeing.
 
     The manifest is rewritten atomically under the union of its existing
@@ -1728,9 +1725,9 @@ DECISION_UNLABELLED = ""
 # arrangement matches the one recorded, and whether the start position is really the
 # arm, are deliberately not screening criteria: judging them requires being shown
 # the pipeline's own answer, and a scene kept or dropped on agreement with that
-# answer would make the geometry unfalsifiable. Those two are measured instead, on a
-# random subsample labelled blind (`draw_validation_sample`), where disagreement is
-# reported rather than removed.
+# answer would make the geometry unfalsifiable. Those two are measured instead, on
+# every eligible scene labelled blind (`draw_validation_sample` over the pool
+# `agreement_pool` resolves), where disagreement is reported rather than removed.
 REJECT_NO_SECOND_INSTANCE = "no_second_instance"   # the copy does not read as a
                                                   # second object of the named kind
 REJECT_PASTE_IMPLAUSIBLE = "paste_implausible"     # it reads as a patch: a seam, a
@@ -1753,11 +1750,10 @@ REVIEW_FIELDS = [
 def build_review_rows(scenes, existing=None):
     """One review row per constructed scene, preserving any decision already made.
 
-    Covers the whole set rather than a sample, because the purpose is to decide
-    inclusion for each scene. The random sample in `draw_validation_sample` keeps
-    its separate purpose of measuring how well the recorded geometry matches human
-    reading, and it is drawn from the pool `agreement_pool` resolves rather than
-    from every scene reviewed here. Approval can be conditioned on without
+    Covers the whole built set rather than a subset, because the purpose is to
+    decide inclusion for each scene. Geometry agreement is a separate
+    measurement, taken over the pool `agreement_pool` resolves rather than over
+    every scene reviewed here. Approval can be conditioned on without
     circularity because the screen never sees the recorded arrangement, so a
     decision carries no information about the quantity the agreement number
     measures.
@@ -2180,12 +2176,12 @@ def evaluation_scenes(out_dir: str, scenes=None):
 
 
 def agreement_pool(out_dir: str, scenes=None, review_rows=None):
-    """The scenes a geometry agreement sample may be drawn from, and which pool.
+    """The scenes geometry agreement is measured on, and which pool.
 
     Resolved here rather than at the call site. An earlier version let the
     notebook fall back to the whole constructed manifest when no frozen set
-    existed, which drew the sample from rejected and unscreened scenes and made
-    the agreement number describe a set the probe never runs on.
+    existed, which labelled rejected and unscreened scenes and made the
+    agreement number describe a set the probe never runs on.
 
     The frozen set is the pool once it exists, since agreement is a claim about
     the stimuli the experiments use. Before the freeze the pool is the approved
@@ -2193,7 +2189,7 @@ def agreement_pool(out_dir: str, scenes=None, review_rows=None):
     that also make the arrangement harder to read, so admitting rejections would
     understate agreement on the set that is actually used, and an unscreened
     scene is of unknown quality. Neither substitution is silent, because the pool
-    is returned alongside the rows and recorded with the sample.
+    is returned alongside the rows and recorded with the file.
 
     Restricting to approved scenes does not compromise the blind labelling. The
     screen is decided without the recorded arrangement in view, so approval
